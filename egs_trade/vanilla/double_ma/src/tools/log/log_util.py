@@ -67,7 +67,8 @@ def addlog(name=''):
                 log.exception('Failure Calling Time Consume:%s, Total Time:%s, Err Message:%s', time_str(time.time() - begin1),
                               time_str(time.time() - begin), e)
                 # traceback.print_exc(file=open(log_file, 'a'))
-                sys.exit(0)
+                # exit non-zero so failures are not mistaken for success
+                sys.exit(1)
 
             return data
 
