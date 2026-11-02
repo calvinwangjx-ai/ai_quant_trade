@@ -206,16 +206,24 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
+        # mark held positions to today's close so total capital (and
+        # funds_chg_lst) follows the market on days without trades too
+        for stock_id, pos_info in self._account.pos_dict.items():
+            pos_info['price'] = self._df_dict[stock_id]['close'].iloc[index]
+
         # check total capital in account
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)
 
         if trade_sign:
             # add trading record
-            for stock_id in self._account.trade_dict.keys():
-                # -1: change last data line due to above assigned value is incorrect
-                #   we reassign value here
-                self._account.trade_dict[stock_id].iloc[-1]['capital'] = total_capital
+            for df_trades in self._account.trade_dict.values():
+                # record_log() stored the capital before today's trades were
+                # settled, so reassign it on the rows recorded today. Assign
+                # through .loc in one step: chained ``.iloc[-1]['capital'] =``
+                # writes to a copy under pandas copy-on-write and is lost.
+                today_rows = df_trades['time_index'] == index
+                df_trades.loc[today_rows, 'capital'] = total_capital
 
             message = 'Account Total Capital: %.2f' % total_capital
             self._account.daily_trading_lst.append(message + '\n')
@@ -233,6 +241,12 @@ class BackTester:
             message = '\n' + '===' * 30 + '\n'
             self._account.daily_trading_lst.append(message)
 
+    def _capital_dates(self):
+        """Trade date of each funds_chg_lst entry: entry k is recorded by
+        trading_ctrl(k + 1), and all stocks share the same dates."""
+        df_stock = next(iter(self._df_dict.values()))
+        return list(df_stock['trade_date'].iloc[1:self._data_len])
+
     # ==================== Main Process Control ======================
     @addlog(name='start offline back test')
     def offline_back_test_ctrl(self):
@@ -249,7 +263,8 @@ class BackTester:
                                        self._account.funds_chg_lst,
                                        self._account.pd_gather_trades,
                                        self._df_benchmark,
-                                       self._args.exp_dir)
+                                       self._args.exp_dir,
+                                       capital_dates=self._capital_dates())
         print(df_result)
 
         total_capital = self._account.get_total_capital()
