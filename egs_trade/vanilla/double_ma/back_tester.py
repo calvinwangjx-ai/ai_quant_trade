@@ -206,6 +206,11 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
+        # mark held positions to today's close so total capital (and
+        # funds_chg_lst) follows the market on days without trades too
+        for stock_id, pos_info in self._account.pos_dict.items():
+            pos_info['price'] = self._df_dict[stock_id]['close'].iloc[index]
+
         # check total capital in account
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)

@@ -257,7 +257,14 @@ class TestBackTesterE2E:
                 expected = funds[int(row['time_index']) - 1]
                 assert float(row['capital']) == pytest.approx(expected), stock_id
 
+        # Held positions are marked to market daily, so the equity curve
+        # moves on days without trades, not only when a position is sold.
+        assert np.count_nonzero(np.diff(funds)) > trades['time_index'].nunique()
+
         df_risk = pd.read_csv(tmp_path / 'risk_indicator.csv', index_col=0)
         assert df_risk.loc['total_returns', 'value'] == pytest.approx(
             funds[-1] / funds[0] - 1)
         assert df_risk.loc['max_withdraw', 'value'] < 0
+        if not isinstance(sys.modules.get('ffn'), mock.Mock):
+            for key in ('sharp_ratio', 'sortino_ratio'):
+                assert np.isfinite(df_risk.loc[key, 'value']), key
