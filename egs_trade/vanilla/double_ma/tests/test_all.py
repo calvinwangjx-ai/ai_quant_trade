@@ -2,11 +2,15 @@
 """Unit + e2e tests for refactored egs_trade/vanilla/double_ma."""
 import sys
 import types
+import warnings
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import pandas as pd
+
+# Only exists on pandas versions with Copy-on-Write chained-assignment checks.
+ChainedAssignmentError = getattr(pd.errors, 'ChainedAssignmentError', None)
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ))
@@ -142,7 +146,8 @@ class TestBackTesterE2E:
         ns.override_config = []
         return ns
 
-    def test_e2e_run_with_mock_data(self, tmp_path):
+    def _make_back_tester(self, tmp_path):
+        """Build a BackTester on synthetic data; returns (bt, stock_lst)."""
         import yaml
         with open(PROJ / 'conf' / 'double_ma.yaml', 'r', encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
@@ -194,12 +199,15 @@ class TestBackTesterE2E:
 
         # Patch at the call site (back_tester) because it imported the
         # symbol into its own namespace.
-        with mock.patch('back_tester.TuShareData', FakeTuShareData), \
-             mock.patch('back_tester.plot_trades_on_capital'), \
+        with mock.patch('back_tester.TuShareData', FakeTuShareData):
+            bt = BackTester(self._build_args(tmp_path))
+        return bt, stock_lst
+
+    def test_e2e_run_with_mock_data(self, tmp_path):
+        bt, _ = self._make_back_tester(tmp_path)
+        with mock.patch('back_tester.plot_trades_on_capital'), \
              mock.patch('back_tester.plot_trades_on_k_line'), \
              mock.patch('back_tester.show_plt'):
-            args = self._build_args(tmp_path)
-            bt = BackTester(args)
             bt.offline_back_test_ctrl()
 
         # at least one trade must have happened
@@ -211,3 +219,32 @@ class TestBackTesterE2E:
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
+
+    def test_trading_step_updates_last_trade_capital(self, tmp_path):
+        bt, stock_lst = self._make_back_tester(tmp_path)
+        rising, falling = stock_lst[0], stock_lst[1]
+
+        # A stale earlier trade of a stock that does not trade in the step
+        # below: its capital must not be overwritten by today's total.
+        stale = pd.DataFrame([{'time_index': -1, 'trade_type': 'sell',
+                               'pos': 100, 'capital': 12_345.0}])
+        bt._account.trade_dict[falling] = stale.copy()
+
+        with warnings.catch_warnings():
+            if ChainedAssignmentError is not None:
+                warnings.simplefilter('error', ChainedAssignmentError)
+            for index in range(1, bt._data_len):
+                bt.trading_ctrl(index)
+                if rising in bt._account.trade_dict:
+                    break
+            else:
+                raise AssertionError('rising stock never traded')
+
+        df_trade = bt._account.trade_dict[rising]
+        assert df_trade['trade_type'].iloc[-1] == 'buy'
+        assert df_trade['time_index'].iloc[-1] == index
+        total = bt._account.get_total_capital()
+        assert df_trade['capital'].iloc[-1] == total
+        assert bt._account.funds_chg_lst[-1] == total
+        # untouched: it did not trade at this index
+        pd.testing.assert_frame_equal(bt._account.trade_dict[falling], stale)
