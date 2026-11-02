@@ -2,7 +2,6 @@
 import logging
 import logging.config
 import os
-import sys
 import time
 import traceback
 import datetime
@@ -63,12 +62,17 @@ def addlog(name=''):
                                                          time_str(inner_secs), time_str(time.time() - begin)))
 
             except Exception as e:
-                # traceback.print_exc()
-                log.exception('Failure Calling Time Consume:%s, Total Time:%s, Err Message:%s', time_str(time.time() - begin1),
-                              time_str(time.time() - begin), e)
-                # traceback.print_exc(file=open(log_file, 'a'))
-                # exit non-zero so failures are not mistaken for success
-                sys.exit(1)
+                # log once (innermost decorated call), then re-raise so callers
+                # and the process exit code see the failure (it used to be
+                # swallowed by sys.exit(0), i.e. reported as success)
+                if not getattr(e, '_addlog_logged', False):
+                    log.exception('Failure Calling Time Consume:%s, Total Time:%s, Err Message:%s',
+                                  time_str(time.time() - begin1), time_str(time.time() - begin), e)
+                    try:
+                        e._addlog_logged = True
+                    except AttributeError:
+                        pass
+                raise
 
             return data
 

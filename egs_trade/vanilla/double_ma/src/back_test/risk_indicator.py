@@ -44,8 +44,9 @@ def _cal_beta_and_rises(capital_list: list,
     benchmark ``pct_chg`` is tushare's percent and is converted to a
     fraction. ``df_index`` is never modified.
 
-    :return: (beta, strategy_rise, benchmark_rise); beta is NaN if fewer
-             than two aligned bars or the benchmark variance is zero
+    :return: (beta, strategy_rise, benchmark_rise, n_bars); beta is NaN if
+             fewer than two aligned bars or the benchmark variance is zero;
+             n_bars is the number of aligned daily returns
     """
     if trade_dates is None:
         raise ValueError('trade_dates is required to align the strategy '
@@ -74,7 +75,7 @@ def _cal_beta_and_rises(capital_list: list,
 
     rise = (1 + s).prod() - 1
     sign_rise = (1 + b).prod() - 1
-    return beta, rise, sign_rise
+    return beta, rise, sign_rise, len(aligned)
 
 
 @addlog(name='cal_risk_indicator')
@@ -131,9 +132,9 @@ def cal_risk_indicator(capital: float,
     # Beta > 1: strategy changing larger than benchmark one, vice versa
     # todo: due to index data not available from tushare api without pay
     if len(df_index):
-        beta, rise, sign_rise = _cal_beta_and_rises(capital_list,
-                                                    trade_dates,
-                                                    df_index)
+        beta, rise, sign_rise, n_bars = _cal_beta_and_rises(capital_list,
+                                                            trade_dates,
+                                                            df_index)
         indicator_dict['beta'] = beta
         log.info('Beta Value: %.5f' % beta)
 
@@ -146,8 +147,11 @@ def cal_risk_indicator(capital: float,
         #    over the same date-aligned bars used for beta, as fractions),
         #  Beta: bata ratio is the one calculated above in 3
         #  Rf is risk-free interest rate, can be easily thought as
-        #    Bank Deposit Rate, usually set as 0.04
-        alpha = rise - (base_rise + beta * (sign_rise - base_rise))
+        #    Bank Deposit Rate, usually set as 0.04. base_rise is annual,
+        #    so it is compounded to the same n_bars period as Rp and Rm
+        #    (TRADING_DAYS_PER_YEAR, same as annualize above).
+        rf = (1 + base_rise) ** (n_bars / TRADING_DAYS_PER_YEAR) - 1
+        alpha = rise - (rf + beta * (sign_rise - rf))
         indicator_dict['alpha'] = alpha
         log.info('Alpha Value: %.5f' % alpha)
 

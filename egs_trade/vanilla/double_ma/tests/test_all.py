@@ -67,17 +67,32 @@ class TestAccount:
 
 
 class TestAddLog:
-    def test_exception_exits_non_zero(self):
+    """Failures must not be reported as success: @addlog logs, then
+    re-raises (an uncaught exception exits the process non-zero)."""
+
+    def test_exception_propagates_instead_of_exit(self):
         import pytest
         from src.tools.log.log_util import addlog
 
-        @addlog(name='boom')
-        def boom():
+        @addlog(name='inner')
+        def inner():
             raise ValueError('boom')
 
-        with pytest.raises(SystemExit) as exc_info:
-            boom()
-        assert exc_info.value.code != 0
+        @addlog(name='outer')
+        def outer():
+            return inner()
+
+        with pytest.raises(ValueError, match='boom'):
+            outer()
+
+    def test_return_value_passes_through(self):
+        from src.tools.log.log_util import addlog
+
+        @addlog(name='ok')
+        def ok(x):
+            return x * 2
+
+        assert ok(21) == 42
 
 
 class TestRiskIndicatorRealFfn:
@@ -242,7 +257,9 @@ class TestRiskIndicatorBeta:
         # alpha uses compounded fractional returns over the aligned bars
         rise = np.prod(1 + strat_ret[1:]) - 1
         sign_rise = np.prod(1 + bench_ret[1:]) - 1
-        expected_alpha = rise - (base_rise + 2.0 * (sign_rise - base_rise))
+        # annual risk-free rate compounded over the aligned bars (250/yr)
+        rf = (1 + base_rise) ** ((len(strat_ret) - 1) / 250) - 1
+        expected_alpha = rise - (rf + 2.0 * (sign_rise - rf))
         assert abs(float(df.loc['alpha', 'value']) - expected_alpha) < 1e-9
 
         # caller's benchmark must not be modified
@@ -259,18 +276,20 @@ class TestRiskIndicatorBeta:
                                 trade_dates=df_index['trade_date'].tolist())
         assert np.isnan(float(df.loc['beta', 'value']))
 
-    def test_benchmark_without_trade_dates_raises(self):
-        # call the undecorated helper: @addlog turns exceptions into sys.exit
+    def test_benchmark_without_trade_dates_raises(self, tmp_path):
+        # @addlog re-raises, so the error reaches the caller
         import pytest
-        self._cal_risk_indicator()
-        from src.back_test.risk_indicator import _cal_beta_and_rises
+        cal_risk_indicator = self._cal_risk_indicator()
         df_index = self._benchmark()
         capital_list = list(np.linspace(100_000, 110_000, len(df_index)))
+        trades = self._trades(capital_list)
         with pytest.raises(ValueError, match='trade_dates'):
-            _cal_beta_and_rises(capital_list, None, df_index)
+            cal_risk_indicator(100_000, 0.04, capital_list, trades,
+                               df_index, str(tmp_path))
         with pytest.raises(ValueError, match='same length'):
-            _cal_beta_and_rises(capital_list,
-                                df_index['trade_date'].tolist()[1:], df_index)
+            cal_risk_indicator(100_000, 0.04, capital_list, trades,
+                               df_index, str(tmp_path),
+                               trade_dates=df_index['trade_date'].tolist()[1:])
 
 
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
