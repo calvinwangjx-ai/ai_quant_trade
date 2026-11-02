@@ -132,6 +132,29 @@ class TestEqualAllocation:
         assert equal_allocation(a, select_num=3) == 0
 
 
+# ---------------- risk indicators with the real ffn library ----------------
+class TestRiskIndicatorRealFfn:
+    """Runs before the mocked e2e test (which injects a fake ``ffn``)."""
+
+    def test_sharpe_and_sortino_on_plain_capital_list(self, tmp_path):
+        import pytest
+        ffn = pytest.importorskip('ffn')
+        if isinstance(ffn, mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+
+        rng = np.random.default_rng(0)
+        capital = list(100_000 * np.cumprod(1 + rng.normal(0.0005, 0.01, 300)))
+        trades = pd.DataFrame({'time_index': [10, 50, 120],
+                               'capital': capital[10:121:55][:3],
+                               'trade_detail': ['buy', 'sell', 'buy']})
+        df = cal_risk_indicator(100_000, 0.04, capital, trades,
+                                pd.DataFrame(), str(tmp_path))
+        for key in ('sharp_ratio', 'sortino_ratio', 'max_withdraw'):
+            assert np.isfinite(float(df.loc[key, 'value'])), key
+        assert (tmp_path / 'risk_indicator.csv').exists()
+
+
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
 class TestBackTesterE2E:
     def _build_args(self, exp_dir):
