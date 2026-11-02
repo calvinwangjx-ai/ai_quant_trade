@@ -19,10 +19,87 @@
 # limitations under the License.
 
 import os
+from typing import Optional, Sequence, Tuple
+
 import ffn
+import numpy as np
 import pandas as pd
 
 from src.tools.log.log_util import addlog, log
+
+
+def align_returns(capital_series: pd.Series,
+                  df_index: pd.DataFrame,
+                  capital_dates: Optional[Sequence] = None
+                  ) -> Tuple[pd.Series, pd.Series]:
+    """
+    Build strategy and benchmark daily returns on the same dates and units.
+
+    Both returned series are fractional returns (0.01 == 1%). TuShare's
+    ``pct_chg`` is in percent, so the benchmark is divided by 100 here.
+    ``df_index`` is not modified.
+
+    The first capital point has no previous value, so its return is undefined;
+    that row is dropped from both series rather than filled with 0, because a
+    0 strategy return paired with a non-zero benchmark return would bias beta.
+
+    :param capital_series: account capital, one value per trading day, in
+        chronological order
+    :param df_index: benchmark data with a ``pct_chg`` column in percent and,
+        optionally, a ``trade_date`` column
+    :param capital_dates: trade date of each capital value. If given, the
+        benchmark is matched by ``trade_date``; otherwise the two are matched
+        by position and must have the same length.
+    :return: (strategy returns, benchmark returns), equal length, 0-based index
+    """
+    capital_series = pd.Series(capital_series, dtype=float).reset_index(drop=True)
+    bench_pct = df_index['pct_chg'].astype(float) / 100.0
+
+    if capital_dates is not None:
+        if 'trade_date' not in df_index.columns:
+            raise ValueError('capital_dates given but benchmark has no trade_date column')
+        dates = pd.Series(list(capital_dates)).astype(str)
+        if len(dates) != len(capital_series):
+            raise ValueError('capital_dates length %d != capital length %d'
+                             % (len(dates), len(capital_series)))
+        if dates.duplicated().any() or not dates.is_monotonic_increasing:
+            raise ValueError('capital_dates must be unique and in ascending order')
+
+        bench = pd.Series(bench_pct.to_numpy(),
+                          index=df_index['trade_date'].astype(str).to_numpy())
+        if bench.index.duplicated().any():
+            raise ValueError('benchmark trade_date contains duplicates')
+        missing = dates[~dates.isin(bench.index)]
+        if len(missing):
+            raise ValueError('benchmark has no data for %d trading date(s), e.g. %s'
+                             % (len(missing), missing.iloc[0]))
+        bench_ret = pd.Series(bench.reindex(dates.to_numpy()).to_numpy())
+    else:
+        if len(df_index) != len(capital_series):
+            raise ValueError('benchmark length %d != capital length %d; pass '
+                             'capital_dates to align by trade_date'
+                             % (len(df_index), len(capital_series)))
+        if 'trade_date' in df_index.columns:
+            bench_dates = df_index['trade_date'].astype(str)
+            if bench_dates.duplicated().any() or not bench_dates.is_monotonic_increasing:
+                raise ValueError('benchmark trade_date must be unique and in ascending order')
+        bench_ret = bench_pct.reset_index(drop=True)
+
+    strategy_ret = capital_series.pct_change()
+    return (strategy_ret.iloc[1:].reset_index(drop=True),
+            bench_ret.iloc[1:].reset_index(drop=True))
+
+
+def cal_beta(strategy_ret: pd.Series, bench_ret: pd.Series) -> float:
+    """
+    Beta = Cov(Dp, Dm) / Var(Dm), both with ddof=1.
+
+    Returns NaN when the benchmark variance is zero or undefined.
+    """
+    var = bench_ret.var()
+    if not np.isfinite(var) or var == 0:
+        return float('nan')
+    return float(strategy_ret.cov(bench_ret) / var)
 
 
 @addlog(name='cal_risk_indicator')
@@ -31,14 +108,18 @@ def cal_risk_indicator(capital: float,
                        capital_list: list,
                        df_trade: pd.DataFrame,
                        df_index: pd.DataFrame,
-                       metrics_save_path: str) -> pd.DataFrame:
+                       metrics_save_path: str,
+                       capital_dates: Optional[Sequence] = None) -> pd.DataFrame:
     """
     :param capital: initial money you have for stock trading
     :param base_rise: e.g. Bank Deposit Rate, risk-free interest rate
     :param capital_list: capital changing list during trading period
     :param df_trade: detailed trading info dataframe
-    :param df_index: benchmark of market index
+    :param df_index: benchmark of market index (``pct_chg`` in percent)
     :param metrics_save_path: path to save risk indicator
+    :param capital_dates: trade date of each value in ``capital_list``; used to
+        align the benchmark by ``trade_date``. Without it, ``df_index`` must
+        have one row per capital value, in the same order.
     :return: dataframe with all calculated risk indicators
     """
     indicator_dict = {}
@@ -74,23 +155,19 @@ def cal_risk_indicator(capital: float,
     #  Cov: covariance, Var: variance of benchmark return
     # Beta > 1: strategy changing larger than benchmark one, vice versa
     # todo: due to index data not available from tushare api without pay
-    sign_rise = rise = None
+    sign_rise = rise = beta = None
     if len(df_index):
-        strategy_pct_chg = capital_series.pct_change()
-        strategy_pct_chg.fillna(0)
-        cov = strategy_pct_chg.cov(df_index['pct_chg'])
-        sigma = strategy_pct_chg.cov(df_index['pct_chg'])
-        # Another Solution: np.cov(s1, s2))[0][1]/np.var(s2)
-        beta = cov / sigma
+        # both series are fractional returns on the same dates
+        strategy_pct_chg, bench_pct_chg = align_returns(capital_series,
+                                                        df_index,
+                                                        capital_dates)
+        beta = cal_beta(strategy_pct_chg, bench_pct_chg)
         indicator_dict['beta'] = beta
         log.info('Beta Value: %.5f' % beta)
 
-        df_index.loc[:, 'pct_chg'] /= 100
-        df_index.loc[:, 'pct_chg'] += 1
-        strategy_pct_chg /= 100
-        strategy_pct_chg += 1
-        sign_rise = df_index['pct_chg'].prod(axis=0) - 1
-        rise = strategy_pct_chg.prod(axis=0) - 1
+        # compounded return of benchmark and strategy over the same period
+        sign_rise = (bench_pct_chg + 1).prod() - 1
+        rise = (strategy_pct_chg + 1).prod() - 1
 
     # 4. Alpha
     # alpha is non-system risk. It represents returns which has no
@@ -114,7 +191,7 @@ def cal_risk_indicator(capital: float,
     # Sharp Ratio = (Rp - Rf) / Sigma(p)
     # Rp: annual return, Rf: no-risk interest rate,
     # Sigma(p): changing rate of the strategy (Annual standard deviation of  Strategy Returns)
-    sharp_ratio = ffn.calc_sharpe(capital_returns)
+    sharp_ratio = ffn.calc_sharpe(capital_returns, nperiods=250)
     indicator_dict['sharp_ratio'] = sharp_ratio
     log.info('Sharp Rate: %.5f' % sharp_ratio)
 
@@ -129,7 +206,7 @@ def cal_risk_indicator(capital: float,
     # evaluate strategy loss, the larger value the better
     # Sortino Ratio = (Rp - Rf) / Sigma(d)
     # Rp: annual return, Rf: no-risk interest rate, Sigma(d): strategy downward volatility
-    sortino_ratio = ffn.calc_sortino_ratio(capital_returns)
+    sortino_ratio = ffn.calc_sortino_ratio(capital_returns, nperiods=250)
     indicator_dict['sortino_ratio'] = sortino_ratio
     log.info('Sortino Rate: %.5f' % sortino_ratio)
 

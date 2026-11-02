@@ -244,12 +244,18 @@ class BackTester:
         log.info('*** Total Trading Times: %d' % self._trade_cnt)
 
         # calculate risk indicator
+        # funds_chg_lst[k] is the capital after trading day index k + 1
+        #  (the loop above starts at 1), so pass those dates to align the
+        #  benchmark by trade_date instead of by position
+        first_df = next(iter(self._df_dict.values()))
+        capital_dates = first_df['trade_date'].iloc[1:self._data_len].tolist()
         df_result = cal_risk_indicator(self.test_conditions['capital'],
                                        self.test_conditions['base_rate'],
                                        self._account.funds_chg_lst,
                                        self._account.pd_gather_trades,
                                        self._df_benchmark,
-                                       self._args.exp_dir)
+                                       self._args.exp_dir,
+                                       capital_dates=capital_dates)
         print(df_result)
 
         total_capital = self._account.get_total_capital()
