@@ -212,10 +212,14 @@ class BackTester:
 
         if trade_sign:
             # add trading record
-            for stock_id in self._account.trade_dict.keys():
+            for df_trade in self._account.trade_dict.values():
                 # -1: change last data line due to above assigned value is incorrect
-                #   we reassign value here
-                self._account.trade_dict[stock_id].iloc[-1]['capital'] = total_capital
+                #   we reassign value here. Only rows recorded at this index are
+                #   corrected; earlier trades of other stocks keep their capital.
+                # Single-step .loc so the write is not lost under Copy-on-Write.
+                last_idx = df_trade.index[-1]
+                if df_trade.at[last_idx, 'time_index'] == index:
+                    df_trade.loc[last_idx, 'capital'] = total_capital
 
             message = 'Account Total Capital: %.2f' % total_capital
             self._account.daily_trading_lst.append(message + '\n')
