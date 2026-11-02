@@ -143,11 +143,12 @@ class TestBackTesterE2E:
         ns.override_config = []
         return ns
 
-    def _run_backtest(self, exp_dir, close_fn, n):
+    def _run_backtest(self, exp_dir, close_fn, n, benchmark_close=None):
         """Run BackTester on synthetic data.
 
         ``close_fn(i, t)`` returns the close price array for the i-th stock
-        given ``t = np.arange(n)``.
+        given ``t = np.arange(n)``. ``benchmark_close`` is the benchmark's
+        close prices (default: a straight line).
         """
         import yaml
         with open(PROJ / 'conf' / 'double_ma.yaml', 'r', encoding='utf-8') as f:
@@ -177,11 +178,20 @@ class TestBackTesterE2E:
         from back_tester import BackTester
 
         dates = pd.date_range('2022-01-01', periods=n, freq='D').strftime('%Y%m%d')
-        benchmark_df = pd.DataFrame({
-            'trade_date': dates,
-            'close': np.linspace(3000, 3200, n),
-            'pct_chg': np.zeros(n),
-        })
+        if benchmark_close is None:
+            benchmark_df = pd.DataFrame({
+                'trade_date': dates,
+                'close': np.linspace(3000, 3200, n),
+                'pct_chg': np.zeros(n),
+            })
+        else:
+            bench = pd.Series(benchmark_close, dtype=float)
+            benchmark_df = pd.DataFrame({
+                'trade_date': dates,
+                'close': bench.values,
+                # TuShare reports pct_chg in percent
+                'pct_chg': (bench.pct_change() * 100).fillna(0).values,
+            })
         df_dict = {benchmark: benchmark_df}
         t = np.arange(n)
         for i, code in enumerate(stock_lst):
@@ -240,7 +250,12 @@ class TestBackTesterE2E:
         def close_fn(i, t):
             return 20 + 3 * np.sin(2 * np.pi * t / 40 + i * np.pi / 2)
 
-        bt = self._run_backtest(tmp_path, close_fn, n)
+        # benchmark: the average of the two stocks plus some noise
+        t = np.arange(n)
+        noise = np.random.default_rng(0).normal(0, 0.05, n)
+        benchmark_close = 100 * ((close_fn(0, t) + close_fn(1, t)) / 2 + noise)
+
+        bt = self._run_backtest(tmp_path, close_fn, n, benchmark_close)
         account = bt._account
 
         trades = pd.concat(account.trade_dict.values(), ignore_index=True)
@@ -265,6 +280,15 @@ class TestBackTesterE2E:
         assert df_risk.loc['total_returns', 'value'] == pytest.approx(
             funds[-1] / funds[0] - 1)
         assert df_risk.loc['max_withdraw', 'value'] < 0
+        # beta against the benchmark on the same days, computed directly:
+        # funds[k] is the close of day offset + k, where offset is the
+        # moving-average warm-up plus the first (skipped) trading index
+        offset = n - len(funds)
+        rs = funds[1:] / funds[:-1] - 1
+        rm = pd.Series(benchmark_close).pct_change().values[offset + 1:]
+        expected_beta = np.cov(rs, rm)[0, 1] / np.var(rm, ddof=1)
+        assert df_risk.loc['beta', 'value'] == pytest.approx(expected_beta)
+        assert np.isfinite(df_risk.loc['alpha', 'value'])
         if not isinstance(sys.modules.get('ffn'), mock.Mock):
             for key in ('sharp_ratio', 'sortino_ratio'):
                 assert np.isfinite(df_risk.loc[key, 'value']), key

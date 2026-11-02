@@ -19,7 +19,10 @@
 # limitations under the License.
 
 import os
+from typing import Optional, Sequence, Tuple
+
 import ffn
+import numpy as np
 import pandas as pd
 
 from src.tools.log.log_util import addlog, log
@@ -30,13 +33,79 @@ from src.tools.log.log_util import addlog, log
 TRADING_DAYS_PER_YEAR = 250
 
 
+def align_daily_returns(capital_series: pd.Series,
+                        df_index: pd.DataFrame,
+                        capital_dates: Optional[Sequence] = None
+                        ) -> Tuple[pd.Series, pd.Series]:
+    """Daily returns of the strategy and the benchmark on common days.
+
+    Both are returned as fractions (0.01 == 1%). The benchmark's
+    ``pct_chg`` column (TuShare) is in percent. ``df_index`` is not
+    modified.
+    """
+    strategy_ret = capital_series.pct_change()
+    benchmark_ret = df_index['pct_chg'].astype(float) / 100
+
+    if capital_dates is not None:
+        if len(capital_dates) != len(capital_series):
+            raise ValueError('capital_dates has %d entries, capital_list %d'
+                             % (len(capital_dates), len(capital_series)))
+        strategy_ret.index = pd.Index([str(d) for d in capital_dates])
+        benchmark_ret.index = pd.Index(
+            [str(d) for d in df_index['trade_date']])
+    elif len(df_index) != len(capital_series):
+        log.warning('benchmark has %d rows but capital_list has %d and no '
+                    'capital_dates were given; cannot align them for beta '
+                    '/ alpha' % (len(df_index), len(capital_series)))
+        empty = pd.Series(dtype=float)
+        return empty, empty
+    else:
+        benchmark_ret.index = strategy_ret.index
+
+    df = pd.concat({'strategy': strategy_ret, 'benchmark': benchmark_ret},
+                   axis=1, join='inner').dropna()
+    return df['strategy'], df['benchmark']
+
+
+def calc_beta_alpha(strategy_ret: pd.Series,
+                    benchmark_ret: pd.Series,
+                    risk_free: float,
+                    one_year: int = TRADING_DAYS_PER_YEAR
+                    ) -> Tuple[float, float]:
+    """CAPM beta and annualized alpha from aligned daily returns.
+
+    beta  = Cov(Rs, Rm) / Var(Rm)
+    alpha = Rp - [Rf + beta * (Rm - Rf)], with Rp / Rm the annualized
+            strategy / benchmark returns over the same days and Rf the
+            annual risk-free rate.
+    Returns (nan, nan) when there is too little data or the benchmark
+    does not move.
+    """
+    n = len(strategy_ret)
+    if n < 2 or not benchmark_ret.var() > 0:
+        log.warning('beta / alpha undefined: %d aligned days, benchmark '
+                    'variance %s' % (n, benchmark_ret.var()))
+        return np.nan, np.nan
+
+    beta = strategy_ret.cov(benchmark_ret) / benchmark_ret.var()
+
+    def annualized(ret: pd.Series) -> float:
+        return (1 + ret).prod() ** (one_year / n) - 1
+
+    alpha = annualized(strategy_ret) - (
+        risk_free + beta * (annualized(benchmark_ret) - risk_free))
+    return float(beta), float(alpha)
+
+
 @addlog(name='cal_risk_indicator')
 def cal_risk_indicator(capital: float,
                        base_rise: float,
                        capital_list: list,
                        df_trade: pd.DataFrame,
                        df_index: pd.DataFrame,
-                       metrics_save_path: str) -> pd.DataFrame:
+                       metrics_save_path: str,
+                       capital_dates: Optional[Sequence] = None
+                       ) -> pd.DataFrame:
     """
     :param capital: initial money you have for stock trading
     :param base_rise: e.g. Bank Deposit Rate, risk-free interest rate
@@ -44,6 +113,9 @@ def cal_risk_indicator(capital: float,
     :param df_trade: detailed trading info dataframe
     :param df_index: benchmark of market index
     :param metrics_save_path: path to save risk indicator
+    :param capital_dates: trade date of each entry in capital_list, used to
+        line it up with df_index['trade_date'] for beta / alpha. Without
+        it the two are paired by position, which needs equal lengths.
     :return: dataframe with all calculated risk indicators
     """
     indicator_dict = {}
@@ -79,38 +151,24 @@ def cal_risk_indicator(capital: float,
     #  Beta = Cov(Dp, Dm) / Var(Dm)
     #  Cov: covariance, Var: variance of benchmark return
     # Beta > 1: strategy changing larger than benchmark one, vice versa
-    # todo: due to index data not available from tushare api without pay
-    sign_rise = rise = None
-    if len(df_index):
-        strategy_pct_chg = capital_series.pct_change()
-        strategy_pct_chg.fillna(0)
-        cov = strategy_pct_chg.cov(df_index['pct_chg'])
-        sigma = strategy_pct_chg.cov(df_index['pct_chg'])
-        # Another Solution: np.cov(s1, s2))[0][1]/np.var(s2)
-        beta = cov / sigma
-        indicator_dict['beta'] = beta
-        log.info('Beta Value: %.5f' % beta)
-
-        df_index.loc[:, 'pct_chg'] /= 100
-        df_index.loc[:, 'pct_chg'] += 1
-        strategy_pct_chg /= 100
-        strategy_pct_chg += 1
-        sign_rise = df_index['pct_chg'].prod(axis=0) - 1
-        rise = strategy_pct_chg.prod(axis=0) - 1
-
+    #
     # 4. Alpha
     # alpha is non-system risk. It represents returns which has no
     #  relationship with market fluctuation. E.g., if strategy return
     #  is 20%, benchmark return is 10%, the alpha is 10%.
     #  Alpha = Rp - [Rf + Beta * (Rm - Rf)]
-    #  Rp: strategy annual returns, Rm benchmark returns,
+    #  Rp: strategy annual returns, Rm benchmark annual returns,
     #  Beta: bata ratio is the one calculated above in 3
     #  Rf is risk-free interest rate, can be easily thought as
     #    Bank Deposit Rate, usually set as 0.04
     # todo: due to index data not available from tushare api without pay
     if len(df_index):
-        alpha = rise - (base_rise + beta * (sign_rise - base_rise))
+        strategy_ret, benchmark_ret = align_daily_returns(
+            capital_series, df_index, capital_dates)
+        beta, alpha = calc_beta_alpha(strategy_ret, benchmark_ret, base_rise)
+        indicator_dict['beta'] = beta
         indicator_dict['alpha'] = alpha
+        log.info('Beta Value: %.5f' % beta)
         log.info('Alpha Value: %.5f' % alpha)
 
     # 5. calculate sharp rate

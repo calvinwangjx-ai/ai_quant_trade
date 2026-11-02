@@ -241,6 +241,12 @@ class BackTester:
             message = '\n' + '===' * 30 + '\n'
             self._account.daily_trading_lst.append(message)
 
+    def _capital_dates(self):
+        """Trade date of each funds_chg_lst entry: entry k is recorded by
+        trading_ctrl(k + 1), and all stocks share the same dates."""
+        df_stock = next(iter(self._df_dict.values()))
+        return list(df_stock['trade_date'].iloc[1:self._data_len])
+
     # ==================== Main Process Control ======================
     @addlog(name='start offline back test')
     def offline_back_test_ctrl(self):
@@ -257,7 +263,8 @@ class BackTester:
                                        self._account.funds_chg_lst,
                                        self._account.pd_gather_trades,
                                        self._df_benchmark,
-                                       self._args.exp_dir)
+                                       self._args.exp_dir,
+                                       capital_dates=self._capital_dates())
         print(df_result)
 
         total_capital = self._account.get_total_capital()
