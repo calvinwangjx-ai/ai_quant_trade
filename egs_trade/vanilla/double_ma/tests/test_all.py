@@ -80,6 +80,28 @@ class TestAddLog:
         assert exc_info.value.code != 0
 
 
+class TestRiskIndicatorRealFfn:
+    def test_ratios_with_integer_indexed_equity(self, tmp_path):
+        """Real ffn cannot infer frequency from a plain list; must not crash."""
+        import pytest
+        ffn = pytest.importorskip('ffn')
+        if isinstance(ffn, mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+
+        rng = np.random.default_rng(0)
+        equity = list(100_000 * np.cumprod(1 + rng.normal(0.001, 0.01, 60)))
+        df_trade = pd.DataFrame({'time_index': [5, 20, 40],
+                                 'capital': [99_000.0, 101_000.0, 103_000.0],
+                                 'trade_detail': ['b', 's', 'b']})
+        df_res = cal_risk_indicator(100_000, 0.04, equity, df_trade,
+                                    pd.DataFrame(), str(tmp_path))
+
+        for key in ('sharp_ratio', 'sortino_ratio', 'max_withdraw'):
+            assert np.isfinite(float(df_res.loc[key, 'value'])), key
+        assert (tmp_path / 'risk_indicator.csv').exists()
+
+
 class TestCalculateFee:
     def test_buy_commission_only(self):
         price_dict = pd.Series({'close': 10.0, 'low': 9.5, 'high': 10.5})
@@ -248,6 +270,11 @@ class TestBackTesterE2E:
         assert len(funds) == bt._data_len - 1
         n_trade_days = len(bt._account.pd_gather_trades)
         assert len(set(np.round(funds, 6))) > n_trade_days + 1, funds
+        # each trade row carries the post-trade equity of the bar it traded
+        # on (bars start at index 1, funds_chg_lst at 0)
+        for stock_id, df_trade in bt._account.trade_dict.items():
+            for t_idx, cap in zip(df_trade['time_index'], df_trade['capital']):
+                assert np.isclose(cap, funds[int(t_idx) - 1]), (stock_id, t_idx)
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
