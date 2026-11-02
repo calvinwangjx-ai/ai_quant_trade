@@ -114,7 +114,10 @@ def cal_risk_indicator(capital: float,
     # Sharp Ratio = (Rp - Rf) / Sigma(p)
     # Rp: annual return, Rf: no-risk interest rate,
     # Sigma(p): changing rate of the strategy (Annual standard deviation of  Strategy Returns)
-    sharp_ratio = ffn.calc_sharpe(capital_returns)
+    # capital_series has a plain RangeIndex (no dates), so ffn cannot infer
+    # the return frequency; pass it explicitly (daily bars, 250 per year,
+    # same convention as annualize above).
+    sharp_ratio = ffn.calc_sharpe(capital_returns, nperiods=250)
     indicator_dict['sharp_ratio'] = sharp_ratio
     log.info('Sharp Rate: %.5f' % sharp_ratio)
 
@@ -129,7 +132,7 @@ def cal_risk_indicator(capital: float,
     # evaluate strategy loss, the larger value the better
     # Sortino Ratio = (Rp - Rf) / Sigma(d)
     # Rp: annual return, Rf: no-risk interest rate, Sigma(d): strategy downward volatility
-    sortino_ratio = ffn.calc_sortino_ratio(capital_returns)
+    sortino_ratio = ffn.calc_sortino_ratio(capital_returns, nperiods=250)
     indicator_dict['sortino_ratio'] = sortino_ratio
     log.info('Sortino Rate: %.5f' % sortino_ratio)
 

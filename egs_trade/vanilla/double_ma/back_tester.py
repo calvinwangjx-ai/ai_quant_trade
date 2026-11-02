@@ -206,7 +206,10 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
-        # check total capital in account
+        # mark held positions to today's close, then check total capital
+        self._account.mark_to_market(
+            {stock_id: df['close'].iloc[index]
+             for stock_id, df in self._df_dict.items()})
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)
 
@@ -215,7 +218,10 @@ class BackTester:
             for stock_id in self._account.trade_dict.keys():
                 # -1: change last data line due to above assigned value is incorrect
                 #   we reassign value here
-                self._account.trade_dict[stock_id].iloc[-1]['capital'] = total_capital
+                #   (single .loc call: chained `.iloc[-1]['capital'] = ...`
+                #   is a silent no-op under pandas Copy-on-Write)
+                df_trade = self._account.trade_dict[stock_id]
+                df_trade.loc[df_trade.index[-1], 'capital'] = total_capital
 
             message = 'Account Total Capital: %.2f' % total_capital
             self._account.daily_trading_lst.append(message + '\n')

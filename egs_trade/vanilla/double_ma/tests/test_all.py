@@ -132,6 +132,65 @@ class TestEqualAllocation:
         assert equal_allocation(a, select_num=3) == 0
 
 
+class TestMarkToMarket:
+    def test_open_position_value_follows_price(self):
+        a = Account(10_000)
+        a.cash = 9_000
+        a.pos_dict = {'A': {'pos_num': 100, 'price': 10.0}}
+        assert a.get_total_capital() == 10_000
+
+        a.mark_to_market({'A': 12.0, 'B': 99.0})  # B not held: ignored
+        assert a.get_total_capital() == 10_200
+        assert 'B' not in a.pos_dict
+
+        a.mark_to_market({'A': 8.0})
+        assert a.get_total_capital() == 9_800
+
+    def test_missing_price_keeps_last_value(self):
+        a = Account(10_000)
+        a.cash = 9_000
+        a.pos_dict = {'A': {'pos_num': 100, 'price': 10.0}}
+        a.mark_to_market({})
+        assert a.get_total_capital() == 10_000
+
+
+class TestAddlogFailureExitCode:
+    def test_exception_exits_non_zero(self):
+        import pytest
+        from src.tools.log.log_util import addlog
+
+        @addlog(name='boom')
+        def boom():
+            raise RuntimeError('boom')
+
+        with pytest.raises(SystemExit) as exc:
+            boom()
+        assert exc.value.code != 0
+
+
+# ---------------- risk indicators with the real ffn library ----------------
+class TestRiskIndicatorRealFfn:
+    """Runs before the mocked e2e test (which injects a fake ``ffn``)."""
+
+    def test_sharpe_and_sortino_on_plain_capital_list(self, tmp_path):
+        import pytest
+        ffn = pytest.importorskip('ffn')
+        if isinstance(ffn, mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+
+        rng = np.random.default_rng(0)
+        capital = list(100_000 * np.cumprod(1 + rng.normal(0.0005, 0.01, 300)))
+        trades = pd.DataFrame({'time_index': [10, 50, 120],
+                               'capital': capital[10:121:55][:3],
+                               'trade_detail': ['buy', 'sell', 'buy']})
+        df = cal_risk_indicator(100_000, 0.04, capital, trades,
+                                pd.DataFrame(), str(tmp_path))
+        for key in ('sharp_ratio', 'sortino_ratio', 'max_withdraw'):
+            assert np.isfinite(float(df.loc[key, 'value'])), key
+        assert (tmp_path / 'risk_indicator.csv').exists()
+
+
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
 class TestBackTesterE2E:
     def _build_args(self, exp_dir):
@@ -208,6 +267,15 @@ class TestBackTesterE2E:
             'No trades happened in e2e simulation; trade_dict=%r' %
             {k: len(v) for k, v in bt._account.trade_dict.items()}
         )
+        # equity is marked to market: it must move on bars with no trade
+        # while a position is held (stock 0 rises steadily in the mock data)
+        funds = bt._account.funds_chg_lst
+        trade_bars = set(bt._account.pd_gather_trades['time_index'])
+        moved_without_trade = [
+            i for i in range(1, len(funds))
+            if (i + 1) not in trade_bars and abs(funds[i] - funds[i - 1]) > 1e-9
+        ]
+        assert moved_without_trade, 'equity curve only changes on trade days'
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
