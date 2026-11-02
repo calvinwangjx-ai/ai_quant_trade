@@ -187,6 +187,92 @@ class TestEqualAllocation:
         assert equal_allocation(a, select_num=3) == 0
 
 
+# ---------------- risk indicator: beta / alpha (real ffn) ----------------
+class TestRiskIndicatorBeta:
+    """Needs the real ``ffn``; runs before the mocked e2e test, which
+    injects a fake ``ffn`` into ``sys.modules``."""
+
+    @staticmethod
+    def _cal_risk_indicator():
+        import pytest
+        pytest.importorskip('ffn')
+        if isinstance(sys.modules.get('ffn'), mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+        return cal_risk_indicator
+
+    @staticmethod
+    def _benchmark(n=100, seed=0):
+        rng = np.random.default_rng(seed)
+        dates = pd.bdate_range('2022-01-03', periods=n).strftime('%Y%m%d')
+        return pd.DataFrame({
+            'trade_date': dates,
+            'close': 3000 * np.cumprod(1 + rng.normal(0, 0.01, n)),
+            'pct_chg': rng.normal(0.05, 1.0, n),  # percent, like tushare
+        })
+
+    @staticmethod
+    def _trades(capital_list):
+        return pd.DataFrame({'time_index': [0, 1],
+                             'capital': capital_list[:2],
+                             'trade_detail': ['buy', 'sell']})
+
+    def test_double_benchmark_returns_gives_beta_two(self, tmp_path):
+        cal_risk_indicator = self._cal_risk_indicator()
+        df_index = self._benchmark()
+        df_index_before = df_index.copy(deep=True)
+
+        # strategy only covers bars after a 20-bar warm-up (like the MA
+        # drop + skipped bar 0), so alignment must be by trade date
+        start = 20
+        bench_ret = df_index['pct_chg'].to_numpy()[start:] / 100
+        strat_ret = 2 * bench_ret
+        strat_ret[0] = 0.0  # first bar has no previous capital
+        capital_list = list(100_000 * np.cumprod(1 + strat_ret))
+        trade_dates = df_index['trade_date'].iloc[start:].tolist()
+
+        base_rise = 0.04
+        df = cal_risk_indicator(100_000, base_rise, capital_list,
+                                self._trades(capital_list), df_index,
+                                str(tmp_path), trade_dates=trade_dates)
+
+        beta = float(df.loc['beta', 'value'])
+        assert abs(beta - 2.0) < 1e-9
+
+        # alpha uses compounded fractional returns over the aligned bars
+        rise = np.prod(1 + strat_ret[1:]) - 1
+        sign_rise = np.prod(1 + bench_ret[1:]) - 1
+        expected_alpha = rise - (base_rise + 2.0 * (sign_rise - base_rise))
+        assert abs(float(df.loc['alpha', 'value']) - expected_alpha) < 1e-9
+
+        # caller's benchmark must not be modified
+        pd.testing.assert_frame_equal(df_index, df_index_before)
+
+    def test_zero_variance_benchmark_gives_nan_beta(self, tmp_path):
+        cal_risk_indicator = self._cal_risk_indicator()
+        df_index = self._benchmark()
+        df_index['pct_chg'] = 0.0
+        capital_list = list(np.linspace(100_000, 110_000, len(df_index)))
+        df = cal_risk_indicator(100_000, 0.04, capital_list,
+                                self._trades(capital_list), df_index,
+                                str(tmp_path),
+                                trade_dates=df_index['trade_date'].tolist())
+        assert np.isnan(float(df.loc['beta', 'value']))
+
+    def test_benchmark_without_trade_dates_raises(self):
+        # call the undecorated helper: @addlog turns exceptions into sys.exit
+        import pytest
+        self._cal_risk_indicator()
+        from src.back_test.risk_indicator import _cal_beta_and_rises
+        df_index = self._benchmark()
+        capital_list = list(np.linspace(100_000, 110_000, len(df_index)))
+        with pytest.raises(ValueError, match='trade_dates'):
+            _cal_beta_and_rises(capital_list, None, df_index)
+        with pytest.raises(ValueError, match='same length'):
+            _cal_beta_and_rises(capital_list,
+                                df_index['trade_date'].tolist()[1:], df_index)
+
+
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
 class TestBackTesterE2E:
     def _build_args(self, exp_dir):

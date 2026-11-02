@@ -28,20 +28,73 @@ from src.tools.log.log_util import addlog, log
 TRADING_DAYS_PER_YEAR = 250
 
 
+def _to_date_index(dates) -> pd.DatetimeIndex:
+    """Normalise trade dates (str 'YYYYMMDD', int or datetime) to dates."""
+    return pd.DatetimeIndex(pd.to_datetime(pd.Series(dates).astype(str)))
+
+
+def _cal_beta_and_rises(capital_list: list,
+                        trade_dates: list,
+                        df_index: pd.DataFrame):
+    """
+    Align daily strategy returns with benchmark returns on trade date and
+    compute beta plus the compounded returns of both over the aligned bars.
+
+    Strategy returns come from ``capital_list`` (already fractions);
+    benchmark ``pct_chg`` is tushare's percent and is converted to a
+    fraction. ``df_index`` is never modified.
+
+    :return: (beta, strategy_rise, benchmark_rise); beta is NaN if fewer
+             than two aligned bars or the benchmark variance is zero
+    """
+    if trade_dates is None:
+        raise ValueError('trade_dates is required to align the strategy '
+                         'capital with the benchmark (df_index)')
+    if len(trade_dates) != len(capital_list):
+        raise ValueError('trade_dates (%d) and capital_list (%d) must have '
+                         'the same length'
+                         % (len(trade_dates), len(capital_list)))
+
+    strategy_ret = pd.Series(list(capital_list), dtype=float,
+                             index=_to_date_index(trade_dates)).pct_change()
+    benchmark_ret = pd.Series(df_index['pct_chg'].to_numpy(dtype=float) / 100,
+                              index=_to_date_index(df_index['trade_date']))
+    benchmark_ret = benchmark_ret[~benchmark_ret.index.duplicated()]
+
+    aligned = pd.concat({'strategy': strategy_ret, 'benchmark': benchmark_ret},
+                        axis=1, join='inner').dropna()
+    s, b = aligned['strategy'], aligned['benchmark']
+
+    # Beta = Cov(Dp, Dm) / Var(Dm), same ddof for both
+    var_b = b.var()
+    if len(aligned) < 2 or not var_b > 0:
+        beta = float('nan')
+    else:
+        beta = s.cov(b) / var_b
+
+    rise = (1 + s).prod() - 1
+    sign_rise = (1 + b).prod() - 1
+    return beta, rise, sign_rise
+
+
 @addlog(name='cal_risk_indicator')
 def cal_risk_indicator(capital: float,
                        base_rise: float,
                        capital_list: list,
                        df_trade: pd.DataFrame,
                        df_index: pd.DataFrame,
-                       metrics_save_path: str) -> pd.DataFrame:
+                       metrics_save_path: str,
+                       trade_dates: list = None) -> pd.DataFrame:
     """
     :param capital: initial money you have for stock trading
     :param base_rise: e.g. Bank Deposit Rate, risk-free interest rate
     :param capital_list: capital changing list during trading period
     :param df_trade: detailed trading info dataframe
-    :param df_index: benchmark of market index
+    :param df_index: benchmark of market index, needs 'trade_date' and
+                     'pct_chg' (percent, as returned by tushare); not modified
     :param metrics_save_path: path to save risk indicator
+    :param trade_dates: trade date of each entry in capital_list, used to
+                        align with df_index; required when df_index is not empty
     :return: dataframe with all calculated risk indicators
     """
     indicator_dict = {}
@@ -77,35 +130,23 @@ def cal_risk_indicator(capital: float,
     #  Cov: covariance, Var: variance of benchmark return
     # Beta > 1: strategy changing larger than benchmark one, vice versa
     # todo: due to index data not available from tushare api without pay
-    sign_rise = rise = None
     if len(df_index):
-        strategy_pct_chg = capital_series.pct_change()
-        strategy_pct_chg.fillna(0)
-        cov = strategy_pct_chg.cov(df_index['pct_chg'])
-        sigma = strategy_pct_chg.cov(df_index['pct_chg'])
-        # Another Solution: np.cov(s1, s2))[0][1]/np.var(s2)
-        beta = cov / sigma
+        beta, rise, sign_rise = _cal_beta_and_rises(capital_list,
+                                                    trade_dates,
+                                                    df_index)
         indicator_dict['beta'] = beta
         log.info('Beta Value: %.5f' % beta)
 
-        df_index.loc[:, 'pct_chg'] /= 100
-        df_index.loc[:, 'pct_chg'] += 1
-        strategy_pct_chg /= 100
-        strategy_pct_chg += 1
-        sign_rise = df_index['pct_chg'].prod(axis=0) - 1
-        rise = strategy_pct_chg.prod(axis=0) - 1
-
-    # 4. Alpha
-    # alpha is non-system risk. It represents returns which has no
-    #  relationship with market fluctuation. E.g., if strategy return
-    #  is 20%, benchmark return is 10%, the alpha is 10%.
-    #  Alpha = Rp - [Rf + Beta * (Rm - Rf)]
-    #  Rp: strategy annual returns, Rm benchmark returns,
-    #  Beta: bata ratio is the one calculated above in 3
-    #  Rf is risk-free interest rate, can be easily thought as
-    #    Bank Deposit Rate, usually set as 0.04
-    # todo: due to index data not available from tushare api without pay
-    if len(df_index):
+        # 4. Alpha
+        # alpha is non-system risk. It represents returns which has no
+        #  relationship with market fluctuation. E.g., if strategy return
+        #  is 20%, benchmark return is 10%, the alpha is 10%.
+        #  Alpha = Rp - [Rf + Beta * (Rm - Rf)]
+        #  Rp: strategy returns, Rm benchmark returns (both compounded
+        #    over the same date-aligned bars used for beta, as fractions),
+        #  Beta: bata ratio is the one calculated above in 3
+        #  Rf is risk-free interest rate, can be easily thought as
+        #    Bank Deposit Rate, usually set as 0.04
         alpha = rise - (base_rise + beta * (sign_rise - base_rise))
         indicator_dict['alpha'] = alpha
         log.info('Alpha Value: %.5f' % alpha)
