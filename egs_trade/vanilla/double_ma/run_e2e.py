@@ -19,10 +19,15 @@ import numpy as np
 import pandas as pd
 
 # 1. Inject mocks for optional third-party libs that aren't installed.
-for _name in ('tushare', 'ffn', 'talib', 'mplfinance',
+for _name in ('tushare', 'talib', 'mplfinance',
               'mplfinance.original_flavor',
               'data', 'data.private'):
     sys.modules.setdefault(_name, mock.MagicMock())
+# Use the real ffn for risk indicators when installed; mock only as fallback.
+try:
+    import ffn  # noqa: F401
+except ImportError:
+    sys.modules.setdefault('ffn', mock.MagicMock())
 _token = mock.MagicMock()
 _token.tushare_token = 'TEST_TOKEN'
 sys.modules['data.private.tushare_token'] = _token

@@ -24,6 +24,11 @@ import pandas as pd
 
 from src.tools.log.log_util import addlog, log
 
+# trading days in one year, used for annualizing returns and ratios.
+# capital_list is indexed by integers (one entry per trading day), so ffn
+# cannot infer the return frequency itself; pass it explicitly instead.
+TRADING_DAYS_PER_YEAR = 250
+
 
 @addlog(name='cal_risk_indicator')
 def cal_risk_indicator(capital: float,
@@ -58,7 +63,8 @@ def cal_risk_indicator(capital: float,
     # due to its not the real annual return, it's a converted value
     # 250 is the trading days in one year
     annal_returns = ffn.annualize(total_returns,
-                                  len(capital_list), one_year=250)
+                                  len(capital_list),
+                                  one_year=TRADING_DAYS_PER_YEAR)
     indicator_dict['annal_returns'] = annal_returns
     log.info('Annual Return Rate: %.5f' % annal_returns)
 
@@ -114,7 +120,8 @@ def cal_risk_indicator(capital: float,
     # Sharp Ratio = (Rp - Rf) / Sigma(p)
     # Rp: annual return, Rf: no-risk interest rate,
     # Sigma(p): changing rate of the strategy (Annual standard deviation of  Strategy Returns)
-    sharp_ratio = ffn.calc_sharpe(capital_returns)
+    sharp_ratio = ffn.calc_sharpe(capital_returns,
+                                  nperiods=TRADING_DAYS_PER_YEAR)
     indicator_dict['sharp_ratio'] = sharp_ratio
     log.info('Sharp Rate: %.5f' % sharp_ratio)
 
@@ -129,7 +136,8 @@ def cal_risk_indicator(capital: float,
     # evaluate strategy loss, the larger value the better
     # Sortino Ratio = (Rp - Rf) / Sigma(d)
     # Rp: annual return, Rf: no-risk interest rate, Sigma(d): strategy downward volatility
-    sortino_ratio = ffn.calc_sortino_ratio(capital_returns)
+    sortino_ratio = ffn.calc_sortino_ratio(capital_returns,
+                                           nperiods=TRADING_DAYS_PER_YEAR)
     indicator_dict['sortino_ratio'] = sortino_ratio
     log.info('Sortino Rate: %.5f' % sortino_ratio)
 

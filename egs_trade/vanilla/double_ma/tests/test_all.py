@@ -154,10 +154,16 @@ class TestBackTesterE2E:
         # a fake tushare_token. Some imports reach into sub-modules
         # (e.g. ``mplfinance.original_flavor``) so we mock with a package
         # like container using ``mock.MagicMock``.
-        for mod_name in ('tushare', 'ffn', 'talib', 'mplfinance',
+        for mod_name in ('tushare', 'talib', 'mplfinance',
                          'data', 'data.private',
                          'mplfinance.original_flavor'):
             sys.modules.setdefault(mod_name, mock.MagicMock())
+        # Use the real ffn when it is installed so the risk indicator
+        # calculation is actually exercised; mock it only as a fallback.
+        try:
+            import ffn  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault('ffn', mock.MagicMock())
         token_mod = mock.MagicMock()
         token_mod.tushare_token = 'TEST_TOKEN'
         sys.modules['data.private.tushare_token'] = token_mod
