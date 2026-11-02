@@ -7,6 +7,7 @@ from unittest import mock
 
 import numpy as np
 import pandas as pd
+import pytest
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ))
@@ -142,7 +143,12 @@ class TestBackTesterE2E:
         ns.override_config = []
         return ns
 
-    def test_e2e_run_with_mock_data(self, tmp_path):
+    def _run_backtest(self, exp_dir, close_fn, n):
+        """Run BackTester on synthetic data.
+
+        ``close_fn(i, t)`` returns the close price array for the i-th stock
+        given ``t = np.arange(n)``.
+        """
         import yaml
         with open(PROJ / 'conf' / 'double_ma.yaml', 'r', encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
@@ -150,7 +156,7 @@ class TestBackTesterE2E:
         benchmark = cfg['data_condition']['benchmark']
 
         # Inject fake third-party modules that may not be installed in
-        # the test environment (tushare, ffn, talib, mplfinance, etc.) and
+        # the test environment (tushare, talib, mplfinance, etc.) and
         # a fake tushare_token. Some imports reach into sub-modules
         # (e.g. ``mplfinance.original_flavor``) so we mock with a package
         # like container using ``mock.MagicMock``.
@@ -170,7 +176,6 @@ class TestBackTesterE2E:
 
         from back_tester import BackTester
 
-        n = 60
         dates = pd.date_range('2022-01-01', periods=n, freq='D').strftime('%Y%m%d')
         benchmark_df = pd.DataFrame({
             'trade_date': dates,
@@ -178,15 +183,15 @@ class TestBackTesterE2E:
             'pct_chg': np.zeros(n),
         })
         df_dict = {benchmark: benchmark_df}
+        t = np.arange(n)
         for i, code in enumerate(stock_lst):
-            slope = 0.05 if i == 0 else -0.03  # first stock up, second down
-            base = np.linspace(10 + i * 5, 10 + i * 5 + slope * n, n)
+            close = close_fn(i, t)
             df_dict[code] = pd.DataFrame({
                 'trade_date': dates,
-                'open': base,
-                'high': base * 1.02,
-                'low': base * 0.98,
-                'close': base,
+                'open': close,
+                'high': close * 1.02,
+                'low': close * 0.98,
+                'close': close,
                 'vol': np.ones(n) * 1_000_000,
             })
 
@@ -204,9 +209,18 @@ class TestBackTesterE2E:
              mock.patch('back_tester.plot_trades_on_capital'), \
              mock.patch('back_tester.plot_trades_on_k_line'), \
              mock.patch('back_tester.show_plt'):
-            args = self._build_args(tmp_path)
-            bt = BackTester(args)
+            bt = BackTester(self._build_args(exp_dir))
             bt.offline_back_test_ctrl()
+        return bt
+
+    def test_e2e_run_with_mock_data(self, tmp_path):
+        n = 60
+
+        def close_fn(i, t):
+            slope = 0.05 if i == 0 else -0.03  # first stock up, second down
+            return np.linspace(10 + i * 5, 10 + i * 5 + slope * n, n)
+
+        bt = self._run_backtest(tmp_path, close_fn, n)
 
         # at least one trade must have happened
         total_trade_rows = sum(len(df) for df in bt._account.trade_dict.values())
@@ -217,3 +231,33 @@ class TestBackTesterE2E:
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
+
+    def test_e2e_oscillating_prices(self, tmp_path):
+        # Sine-wave prices make the 10/20-day moving averages cross
+        # repeatedly, so stocks are bought, held and sold several times.
+        n = 160
+
+        def close_fn(i, t):
+            return 20 + 3 * np.sin(2 * np.pi * t / 40 + i * np.pi / 2)
+
+        bt = self._run_backtest(tmp_path, close_fn, n)
+        account = bt._account
+
+        trades = pd.concat(account.trade_dict.values(), ignore_index=True)
+        assert (trades['trade_type'] == 'buy').sum() >= 2
+        assert (trades['trade_type'] == 'sell').sum() >= 2
+
+        funds = np.asarray(account.funds_chg_lst, dtype=float)
+        assert len(funds) == bt._data_len - 1
+
+        # Each trade record carries the account capital after that day's
+        # trades were settled (funds_chg_lst[k] is recorded for index k+1).
+        for stock_id, df_trades in account.trade_dict.items():
+            for _, row in df_trades.iterrows():
+                expected = funds[int(row['time_index']) - 1]
+                assert float(row['capital']) == pytest.approx(expected), stock_id
+
+        df_risk = pd.read_csv(tmp_path / 'risk_indicator.csv', index_col=0)
+        assert df_risk.loc['total_returns', 'value'] == pytest.approx(
+            funds[-1] / funds[0] - 1)
+        assert df_risk.loc['max_withdraw', 'value'] < 0
