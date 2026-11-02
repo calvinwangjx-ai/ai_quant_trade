@@ -17,8 +17,8 @@ try:
 except ImportError:
     sys.modules.setdefault('ffn', mock.MagicMock())
 
-from src.back_test.risk_indicator import (align_returns, cal_beta,
-                                          cal_risk_indicator)
+from src.back_test.risk_indicator import (align_returns, annualize_return,
+                                          cal_beta, cal_risk_indicator)
 
 
 def _synthetic_pair(n=250, k=1.5, capital=100_000.0, seed=0):
@@ -108,6 +108,22 @@ class TestCalBeta:
         assert np.isnan(cal_beta(strat, bench))
 
 
+class TestAnnualizeReturn:
+    def test_one_year_is_unchanged(self):
+        assert annualize_return(0.1, 250) == pytest.approx(0.1)
+
+    def test_two_years(self):
+        # 21% over two years is 10% a year
+        assert annualize_return(0.21, 500) == pytest.approx(0.1)
+
+    def test_half_year(self):
+        assert annualize_return(0.05, 125) == pytest.approx(1.05 ** 2 - 1)
+
+    def test_undefined_cases_are_nan(self):
+        assert np.isnan(annualize_return(0.1, 0))
+        assert np.isnan(annualize_return(-1.0, 250))
+
+
 class TestCalRiskIndicatorBeta:
     def test_beta_is_1_5_and_alpha_consistent(self, tmp_path):
         capital_list, df_index, bench_ret = _synthetic_pair()
@@ -120,8 +136,10 @@ class TestCalRiskIndicatorBeta:
         beta = df_result.loc['beta', 'value']
         assert beta == pytest.approx(1.5)
 
-        rise = capital_list[-1] / capital_list[0] - 1
-        sign_rise = np.prod(1 + bench_ret[1:]) - 1
+        # 250 capital points -> 249 daily returns; annualize both legs
+        n = len(capital_list) - 1
+        rise = (capital_list[-1] / capital_list[0]) ** (250 / n) - 1
+        sign_rise = np.prod(1 + bench_ret[1:]) ** (250 / n) - 1
         expected_alpha = rise - (0.04 + 1.5 * (sign_rise - 0.04))
         assert df_result.loc['alpha', 'value'] == pytest.approx(expected_alpha)
 
@@ -135,3 +153,26 @@ class TestCalRiskIndicatorBeta:
                                        df_trade, df_index, str(tmp_path),
                                        capital_dates=df_index['trade_date'][20:])
         assert df_result.loc['beta', 'value'] == pytest.approx(1.5)
+
+    def test_alpha_uses_annual_rates_for_multi_year_backtest(self, tmp_path):
+        # Two years where the strategy earns exactly the risk-free rate with
+        # no market exposure (benchmark moves, strategy return is constant).
+        n_days = 500
+        rf = 0.04
+        daily_rf = (1 + rf) ** (1 / 250) - 1
+        rng = np.random.default_rng(3)
+        bench_ret = rng.normal(0.0, 0.01, n_days + 1)
+        capital_list = (100_000.0 * (1 + daily_rf) ** np.arange(n_days + 1)).tolist()
+        df_index = pd.DataFrame({
+            'trade_date': pd.bdate_range('2020-01-01', periods=n_days + 1).strftime('%Y%m%d'),
+            'pct_chg': bench_ret * 100,
+        })
+        df_trade = pd.DataFrame({'capital': capital_list[::100]})
+
+        df_result = cal_risk_indicator(100_000.0, rf, capital_list, df_trade,
+                                       df_index, str(tmp_path))
+
+        assert df_result.loc['beta', 'value'] == pytest.approx(0.0, abs=1e-9)
+        # earning the risk-free rate with beta 0 is zero alpha; comparing the
+        # two-year total (~8.16%) with the yearly 4% would give ~4.16%
+        assert df_result.loc['alpha', 'value'] == pytest.approx(0.0, abs=1e-9)

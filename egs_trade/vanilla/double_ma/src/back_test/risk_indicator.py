@@ -27,6 +27,9 @@ import pandas as pd
 
 from src.tools.log.log_util import addlog, log
 
+# trading days in one year, used to annualize returns
+TRADING_DAYS_PER_YEAR = 250
+
 
 def align_returns(capital_series: pd.Series,
                   df_index: pd.DataFrame,
@@ -102,6 +105,21 @@ def cal_beta(strategy_ret: pd.Series, bench_ret: pd.Series) -> float:
     return float(strategy_ret.cov(bench_ret) / var)
 
 
+def annualize_return(total_return: float, n_periods: int,
+                     periods_per_year: int = TRADING_DAYS_PER_YEAR) -> float:
+    """
+    Convert a compounded return over ``n_periods`` daily periods to a yearly
+    rate: (1 + R) ^ (periods_per_year / n_periods) - 1.
+
+    Returns NaN when there are no periods or the capital was wiped out
+    (1 + R <= 0), where a yearly rate is undefined.
+    """
+    growth = 1.0 + float(total_return)
+    if n_periods <= 0 or growth <= 0:
+        return float('nan')
+    return growth ** (periods_per_year / n_periods) - 1.0
+
+
 @addlog(name='cal_risk_indicator')
 def cal_risk_indicator(capital: float,
                        base_rise: float,
@@ -139,7 +157,7 @@ def cal_risk_indicator(capital: float,
     # due to its not the real annual return, it's a converted value
     # 250 is the trading days in one year
     annal_returns = ffn.annualize(total_returns,
-                                  len(capital_list), one_year=250)
+                                  len(capital_list), one_year=TRADING_DAYS_PER_YEAR)
     indicator_dict['annal_returns'] = annal_returns
     log.info('Annual Return Rate: %.5f' % annal_returns)
 
@@ -165,16 +183,19 @@ def cal_risk_indicator(capital: float,
         indicator_dict['beta'] = beta
         log.info('Beta Value: %.5f' % beta)
 
-        # compounded return of benchmark and strategy over the same period
-        sign_rise = (bench_pct_chg + 1).prod() - 1
-        rise = (strategy_pct_chg + 1).prod() - 1
+        # compounded return of benchmark and strategy over the same days,
+        #  annualized so they match base_rise, which is a yearly rate
+        n_periods = len(strategy_pct_chg)
+        sign_rise = annualize_return((bench_pct_chg + 1).prod() - 1, n_periods)
+        rise = annualize_return((strategy_pct_chg + 1).prod() - 1, n_periods)
 
     # 4. Alpha
     # alpha is non-system risk. It represents returns which has no
     #  relationship with market fluctuation. E.g., if strategy return
     #  is 20%, benchmark return is 10%, the alpha is 10%.
     #  Alpha = Rp - [Rf + Beta * (Rm - Rf)]
-    #  Rp: strategy annual returns, Rm benchmark returns,
+    #  Rp: strategy annual returns, Rm: benchmark annual returns,
+    #    both annualized from the backtest period (see step 3)
     #  Beta: bata ratio is the one calculated above in 3
     #  Rf is risk-free interest rate, can be easily thought as
     #    Bank Deposit Rate, usually set as 0.04
@@ -191,7 +212,7 @@ def cal_risk_indicator(capital: float,
     # Sharp Ratio = (Rp - Rf) / Sigma(p)
     # Rp: annual return, Rf: no-risk interest rate,
     # Sigma(p): changing rate of the strategy (Annual standard deviation of  Strategy Returns)
-    sharp_ratio = ffn.calc_sharpe(capital_returns, nperiods=250)
+    sharp_ratio = ffn.calc_sharpe(capital_returns, nperiods=TRADING_DAYS_PER_YEAR)
     indicator_dict['sharp_ratio'] = sharp_ratio
     log.info('Sharp Rate: %.5f' % sharp_ratio)
 
@@ -206,7 +227,7 @@ def cal_risk_indicator(capital: float,
     # evaluate strategy loss, the larger value the better
     # Sortino Ratio = (Rp - Rf) / Sigma(d)
     # Rp: annual return, Rf: no-risk interest rate, Sigma(d): strategy downward volatility
-    sortino_ratio = ffn.calc_sortino_ratio(capital_returns, nperiods=250)
+    sortino_ratio = ffn.calc_sortino_ratio(capital_returns, nperiods=TRADING_DAYS_PER_YEAR)
     indicator_dict['sortino_ratio'] = sortino_ratio
     log.info('Sortino Rate: %.5f' % sortino_ratio)
 
