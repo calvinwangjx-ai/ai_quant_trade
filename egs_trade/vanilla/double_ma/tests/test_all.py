@@ -2,6 +2,7 @@
 """Unit + e2e tests for refactored egs_trade/vanilla/double_ma."""
 import sys
 import types
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -133,74 +134,94 @@ class TestEqualAllocation:
 
 
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
-class TestBackTesterE2E:
-    def _build_args(self, exp_dir):
-        ns = types.SimpleNamespace()
-        ns.config = str(PROJ / 'conf' / 'double_ma.yaml')
-        ns.data_dir = str(PROJ / 'data')
-        ns.exp_dir = str(exp_dir)
-        ns.override_config = []
-        return ns
+def _load_conf():
+    import yaml
+    with open(PROJ / 'conf' / 'double_ma.yaml', 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
 
+
+def _make_df_dict(close_by_stock, benchmark, n):
+    """Build fake TuShare data: ``close_by_stock`` maps stock id -> close array."""
+    dates = pd.date_range('2022-01-01', periods=n, freq='D').strftime('%Y%m%d')
+    df_dict = {benchmark: pd.DataFrame({
+        'trade_date': dates,
+        'close': np.linspace(3000, 3200, n),
+        'pct_chg': np.zeros(n),
+    })}
+    for code, close in close_by_stock.items():
+        df_dict[code] = pd.DataFrame({
+            'trade_date': dates,
+            'open': close,
+            'high': close * 1.02,
+            'low': close * 0.98,
+            'close': close,
+            'vol': np.ones(n) * 1_000_000,
+        })
+    return df_dict
+
+
+def _run_back_tester(tmp_path, df_dict):
+    """Run BackTester end to end on ``df_dict`` with TuShare/plots mocked.
+
+    Returns ``(back_tester, caught_warnings)``.
+    """
+    # Inject fake third-party modules that may not be installed in
+    # the test environment (tushare, ffn, talib, mplfinance, etc.) and
+    # a fake tushare_token. Some imports reach into sub-modules
+    # (e.g. ``mplfinance.original_flavor``) so we mock with a package
+    # like container using ``mock.MagicMock``.
+    for mod_name in ('tushare', 'ffn', 'talib', 'mplfinance',
+                     'data', 'data.private',
+                     'mplfinance.original_flavor'):
+        sys.modules.setdefault(mod_name, mock.MagicMock())
+    token_mod = mock.MagicMock()
+    token_mod.tushare_token = 'TEST_TOKEN'
+    sys.modules['data.private.tushare_token'] = token_mod
+
+    from back_tester import BackTester
+
+    # Replace TuShareData with a fake class that only implements the
+    # methods BackTester actually calls.
+    class FakeTuShareData:
+        def __init__(self):
+            pass
+
+        def get_df_data(self, *args, **kwargs):
+            return df_dict
+
+    args = types.SimpleNamespace(
+        config=str(PROJ / 'conf' / 'double_ma.yaml'),
+        data_dir=str(PROJ / 'data'),
+        exp_dir=str(tmp_path),
+        override_config=[],
+    )
+
+    # Patch at the call site (back_tester) because it imported the
+    # symbol into its own namespace.
+    with mock.patch('back_tester.TuShareData', FakeTuShareData), \
+         mock.patch('back_tester.plot_trades_on_capital'), \
+         mock.patch('back_tester.plot_trades_on_k_line'), \
+         mock.patch('back_tester.show_plt'), \
+         warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        bt = BackTester(args)
+        bt.offline_back_test_ctrl()
+    return bt, caught
+
+
+class TestBackTesterE2E:
     def test_e2e_run_with_mock_data(self, tmp_path):
-        import yaml
-        with open(PROJ / 'conf' / 'double_ma.yaml', 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
+        cfg = _load_conf()
         stock_lst = cfg['data_condition']['stock_lst']
         benchmark = cfg['data_condition']['benchmark']
 
-        # Inject fake third-party modules that may not be installed in
-        # the test environment (tushare, ffn, talib, mplfinance, etc.) and
-        # a fake tushare_token. Some imports reach into sub-modules
-        # (e.g. ``mplfinance.original_flavor``) so we mock with a package
-        # like container using ``mock.MagicMock``.
-        for mod_name in ('tushare', 'ffn', 'talib', 'mplfinance',
-                         'data', 'data.private',
-                         'mplfinance.original_flavor'):
-            sys.modules.setdefault(mod_name, mock.MagicMock())
-        token_mod = mock.MagicMock()
-        token_mod.tushare_token = 'TEST_TOKEN'
-        sys.modules['data.private.tushare_token'] = token_mod
-
-        from back_tester import BackTester
-
         n = 60
-        dates = pd.date_range('2022-01-01', periods=n, freq='D').strftime('%Y%m%d')
-        benchmark_df = pd.DataFrame({
-            'trade_date': dates,
-            'close': np.linspace(3000, 3200, n),
-            'pct_chg': np.zeros(n),
-        })
-        df_dict = {benchmark: benchmark_df}
+        close_by_stock = {}
         for i, code in enumerate(stock_lst):
             slope = 0.05 if i == 0 else -0.03  # first stock up, second down
-            base = np.linspace(10 + i * 5, 10 + i * 5 + slope * n, n)
-            df_dict[code] = pd.DataFrame({
-                'trade_date': dates,
-                'open': base,
-                'high': base * 1.02,
-                'low': base * 0.98,
-                'close': base,
-                'vol': np.ones(n) * 1_000_000,
-            })
+            close_by_stock[code] = np.linspace(10 + i * 5, 10 + i * 5 + slope * n, n)
 
-        # Replace TuShareData with a fake class that only implements the
-        # methods BackTester actually calls.
-        class FakeTuShareData:
-            def __init__(self):
-                pass
-            def get_df_data(self, *args, **kwargs):
-                return df_dict
-
-        # Patch at the call site (back_tester) because it imported the
-        # symbol into its own namespace.
-        with mock.patch('back_tester.TuShareData', FakeTuShareData), \
-             mock.patch('back_tester.plot_trades_on_capital'), \
-             mock.patch('back_tester.plot_trades_on_k_line'), \
-             mock.patch('back_tester.show_plt'):
-            args = self._build_args(tmp_path)
-            bt = BackTester(args)
-            bt.offline_back_test_ctrl()
+        bt, _ = _run_back_tester(tmp_path, _make_df_dict(close_by_stock, benchmark, n))
 
         # at least one trade must have happened
         total_trade_rows = sum(len(df) for df in bt._account.trade_dict.values())
@@ -211,3 +232,51 @@ class TestBackTesterE2E:
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
+
+    def test_trade_capital_matches_bar_equity(self, tmp_path):
+        """Each trade row's ``capital`` is the post-trade equity of its bar.
+
+        Regression test: ``trading_ctrl`` used a chained assignment
+        (``df.iloc[-1]['capital'] = ...``) that is a no-op under pandas
+        Copy-on-Write, and it also overwrote the last row of stocks that did
+        not trade on the bar.
+        """
+        cfg = _load_conf()
+        stock_a, stock_b = cfg['data_condition']['stock_lst'][:2]
+        benchmark = cfg['data_condition']['benchmark']
+
+        # Two stocks whose MA crossovers happen on different bars, so a bar
+        # where one stock trades must not rewrite the other stock's history.
+        n = 90
+        t = np.arange(n)
+        close_a = 10 + 0.3 * np.where(t < 45, t, 90 - t)  # up, then down
+        close_b = 20 - 0.2 * np.where(t < 60, t, 120 - t)  # down, then up
+        df_dict = _make_df_dict({stock_a: close_a, stock_b: close_b}, benchmark, n)
+
+        bt, caught = _run_back_tester(tmp_path, df_dict)
+
+        chained = [w for w in caught
+                   if w.category.__name__ == 'ChainedAssignmentError'
+                   and w.filename.endswith('back_tester.py')]
+        assert not chained, [str(w.message) for w in chained]
+
+        acct = bt._account
+        # equity recorded for each bar that had a trade
+        bar_equity = dict(zip(acct.pd_gather_trades['time_index'].astype(int),
+                              acct.pd_gather_trades['capital'].astype(float)))
+        # both stocks traded, on different bars
+        assert set(acct.trade_dict) == {stock_a, stock_b}
+        bars_a = set(acct.trade_dict[stock_a]['time_index'].astype(int))
+        bars_b = set(acct.trade_dict[stock_b]['time_index'].astype(int))
+        assert bars_a and bars_b and bars_a != bars_b
+
+        for stock_id, df_trade in acct.trade_dict.items():
+            # the last trade row is the one the reported bug left stale
+            last = df_trade.iloc[-1]
+            bar = int(last['time_index'])
+            # funds_chg_lst starts at bar index 1
+            assert float(last['capital']) == bar_equity[bar] == acct.funds_chg_lst[bar - 1]
+            # every earlier trade row also holds its own bar's equity
+            for _, row in df_trade.iterrows():
+                assert float(row['capital']) == bar_equity[int(row['time_index'])], (
+                    stock_id, int(row['time_index']))
