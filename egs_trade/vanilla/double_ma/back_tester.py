@@ -206,7 +206,10 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
-        # check total capital in account
+        # mark held positions to today's close, then check total capital
+        self._account.mark_to_market(
+            {stock_id: df['close'].iloc[index]
+             for stock_id, df in self._df_dict.items()})
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)
 

@@ -42,6 +42,17 @@ class Account:
         # log total funds changing of each day even no trades happened on the day
         self.funds_chg_lst = []
 
+    # revalue held positions at the latest price, so total capital reflects
+    #  unrealized P&L (mark-to-market) instead of the entry price
+    def mark_to_market(self, price_dict: dict):
+        """
+        :param price_dict: stock id -> latest price (e.g. today's close);
+            stocks not held, or missing from the dict, are left unchanged
+        """
+        for stock_id, val in self.pos_dict.items():
+            if stock_id in price_dict:
+                val['price'] = price_dict[stock_id]
+
     # total capital is the sum of position current cap with account cash
     @addlog(name='get_total_capital')
     def get_total_capital(self):
