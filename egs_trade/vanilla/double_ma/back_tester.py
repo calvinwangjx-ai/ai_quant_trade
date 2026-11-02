@@ -208,7 +208,13 @@ class BackTester:
                                 pos,
                                 trade_message)
 
-        # 4. final trade record
+        # 4. mark open positions to market at this bar's close, so equity
+        # moves on bars without trades (order_value only prices a position
+        # when it is bought).
+        for stock_id, pos_info in self._account.pos_dict.items():
+            pos_info['price'] = self._df_dict[stock_id]['close'].iloc[index]
+
+        # 5. final trade record
         # check total capital in account
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)

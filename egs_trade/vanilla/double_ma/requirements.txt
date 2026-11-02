@@ -7,4 +7,4 @@ matplotlib>=3.3.4
 ffn>=0.3.6
 mplfinance>=0.12.9b1
 chinese_calendar>=1.7.2
-typeguard>=2.13.0
+typeguard>=2.13.0,<3  # src/ uses check_argument_types, removed in typeguard 3

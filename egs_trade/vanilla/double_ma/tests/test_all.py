@@ -8,6 +8,7 @@ from unittest import mock
 
 import numpy as np
 import pandas as pd
+import pytest
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ))
@@ -209,6 +210,20 @@ def _run_back_tester(tmp_path, df_dict):
     return bt, caught
 
 
+def _two_stock_df_dict():
+    """Two stocks whose MA crossovers happen on different bars, with
+    positions held across many bars without trades."""
+    cfg = _load_conf()
+    stock_a, stock_b = cfg['data_condition']['stock_lst'][:2]
+    benchmark = cfg['data_condition']['benchmark']
+    n = 90
+    t = np.arange(n)
+    close_a = 10 + 0.3 * np.where(t < 45, t, 90 - t)  # up, then down
+    close_b = 20 - 0.2 * np.where(t < 60, t, 120 - t)  # down, then up
+    df_dict = _make_df_dict({stock_a: close_a, stock_b: close_b}, benchmark, n)
+    return stock_a, stock_b, df_dict
+
+
 class TestBackTesterE2E:
     def test_e2e_run_with_mock_data(self, tmp_path):
         cfg = _load_conf()
@@ -241,18 +256,7 @@ class TestBackTesterE2E:
         Copy-on-Write, and it also overwrote the last row of stocks that did
         not trade on the bar.
         """
-        cfg = _load_conf()
-        stock_a, stock_b = cfg['data_condition']['stock_lst'][:2]
-        benchmark = cfg['data_condition']['benchmark']
-
-        # Two stocks whose MA crossovers happen on different bars, so a bar
-        # where one stock trades must not rewrite the other stock's history.
-        n = 90
-        t = np.arange(n)
-        close_a = 10 + 0.3 * np.where(t < 45, t, 90 - t)  # up, then down
-        close_b = 20 - 0.2 * np.where(t < 60, t, 120 - t)  # down, then up
-        df_dict = _make_df_dict({stock_a: close_a, stock_b: close_b}, benchmark, n)
-
+        stock_a, stock_b, df_dict = _two_stock_df_dict()
         bt, caught = _run_back_tester(tmp_path, df_dict)
 
         chained = [w for w in caught
@@ -280,3 +284,44 @@ class TestBackTesterE2E:
             for _, row in df_trade.iterrows():
                 assert float(row['capital']) == bar_equity[int(row['time_index'])], (
                     stock_id, int(row['time_index']))
+
+    def test_equity_marks_open_positions_to_market(self, tmp_path):
+        """On bars without trades, equity moves with the close of held stocks.
+
+        Regression test: held positions kept their purchase price, so the
+        equity curve was flat between trades.
+        """
+        _, _, df_dict = _two_stock_df_dict()
+        bt, _ = _run_back_tester(tmp_path, df_dict)
+        acct = bt._account
+        # funds_chg_lst[k] is the equity at the close of bar k + 1
+        equity = {bar: acct.funds_chg_lst[bar - 1] for bar in range(1, bt._data_len)}
+
+        trades_by_bar = {}
+        for stock_id, df_trade in acct.trade_dict.items():
+            for _, row in df_trade.iterrows():
+                trades_by_bar.setdefault(int(row['time_index']), []).append(
+                    (stock_id, row['trade_type'], int(row['pos'])))
+
+        holdings = {}  # stock id -> shares held after the previous bar
+        checked, moved = 0, 0
+        for bar in range(1, bt._data_len):
+            if bar in trades_by_bar:
+                for stock_id, trade_type, pos in trades_by_bar[bar]:
+                    if trade_type == 'buy':
+                        holdings[stock_id] = pos
+                    else:
+                        holdings.pop(stock_id)
+                continue
+            if bar == 1 or not holdings:
+                continue
+            pnl = sum(pos * (bt._df_dict[sid]['close'].iloc[bar]
+                             - bt._df_dict[sid]['close'].iloc[bar - 1])
+                      for sid, pos in holdings.items())
+            assert equity[bar] == pytest.approx(equity[bar - 1] + pnl), bar
+            checked += 1
+            moved += pnl != 0
+
+        # the scenario must actually exercise held, non-trading bars
+        assert checked > 10 and moved > 10, (checked, moved)
+        assert acct.get_total_capital() == pytest.approx(equity[bt._data_len - 1])

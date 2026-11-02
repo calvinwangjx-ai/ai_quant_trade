@@ -92,9 +92,9 @@ def order_value(account: Account,
         order_type = 'sell'
         hold = False
 
-    # update current stock market value if hold the stock
-    if hold and not len(trade_type):
-        account.pos_dict[stock_id]['price'] = price
+    # held positions are marked to market once per bar by
+    # BackTester.trading_ctrl, not here (order_value is only called for
+    # stocks with a buy/sell signal).
 
     # output log
     message = ''
