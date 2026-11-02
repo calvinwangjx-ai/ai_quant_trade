@@ -46,6 +46,39 @@ class TestAccount:
         # cash 50_000 + position 100 * 11 = 1_100 = 51_100
         assert a.get_total_capital() == 51_100
 
+    def test_open_position_marked_to_market(self):
+        a = Account(50_000)
+        a.pos_dict['600000.SH'] = {'pos_num': 100, 'price': 11.0}
+        # value moves with the current price
+        assert a.get_total_capital({'600000.SH': 12.5}) == 50_000 + 100 * 12.5
+        assert a.total_capital == 51_250
+        assert a.get_total_capital({'600000.SH': 9.0}) == 50_000 + 100 * 9.0
+        # cost basis is left untouched
+        assert a.pos_dict['600000.SH']['price'] == 11.0
+        # no prices -> entry-price valuation (existing behaviour)
+        assert a.get_total_capital() == 51_100
+
+    def test_mark_to_market_falls_back_to_entry_price(self):
+        a = Account(0)
+        a.pos_dict['A'] = {'pos_num': 10, 'price': 5.0}
+        a.pos_dict['B'] = {'pos_num': 20, 'price': 2.0}
+        # only A has a quote; B keeps its entry price; unheld C is ignored
+        assert a.get_total_capital({'A': 6.0, 'C': 100.0}) == 10 * 6.0 + 20 * 2.0
+
+
+class TestAddLog:
+    def test_exception_exits_non_zero(self):
+        import pytest
+        from src.tools.log.log_util import addlog
+
+        @addlog(name='boom')
+        def boom():
+            raise ValueError('boom')
+
+        with pytest.raises(SystemExit) as exc_info:
+            boom()
+        assert exc_info.value.code != 0
+
 
 class TestCalculateFee:
     def test_buy_commission_only(self):
@@ -208,6 +241,13 @@ class TestBackTesterE2E:
             'No trades happened in e2e simulation; trade_dict=%r' %
             {k: len(v) for k, v in bt._account.trade_dict.items()}
         )
+        # daily equity is marked to market: it must change on bars without
+        # trades while a position is held. With realized-only valuation the
+        # number of distinct equity values is bounded by (trade days + 1).
+        funds = bt._account.funds_chg_lst
+        assert len(funds) == bt._data_len - 1
+        n_trade_days = len(bt._account.pd_gather_trades)
+        assert len(set(np.round(funds, 6))) > n_trade_days + 1, funds
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()

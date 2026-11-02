@@ -108,6 +108,11 @@ class BackTester:
 
         return df_stock_dict
 
+    def get_close_prices(self, index):
+        """Return {stock_id: close} for the bar at ``index``."""
+        return {stock_id: df['close'].iloc[index]
+                for stock_id, df in self._df_dict.items()}
+
     @addlog(name='record_log')
     def record_log(self,
                    stock_id,
@@ -206,8 +211,10 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
-        # check total capital in account
-        total_capital = self._account.get_total_capital()
+        # check total capital in account, marking open positions to market
+        # with the current bar's close so the daily equity curve reflects
+        # unrealized P&L (pos_dict keeps the entry price as cost basis)
+        total_capital = self._account.get_total_capital(self.get_close_prices(index))
         self._account.funds_chg_lst.append(total_capital)
 
         if trade_sign:
@@ -252,7 +259,8 @@ class BackTester:
                                        self._args.exp_dir)
         print(df_result)
 
-        total_capital = self._account.get_total_capital()
+        total_capital = self._account.get_total_capital(
+            self.get_close_prices(self._data_len - 1))
         print('Account Capital: ', total_capital)
         print('Account Net Profit: ',
               total_capital - self.test_conditions['capital'])

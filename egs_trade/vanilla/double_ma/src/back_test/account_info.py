@@ -18,6 +18,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Dict, Optional
+
 import pandas as pd
 
 from src.tools.log.log_util import addlog
@@ -28,7 +30,8 @@ class Account:
         # 1. dynamic changing info
         self.cash = capital  # available cash for trading
         self.total_capital = capital
-        # stock id: {pos_num, price}, price for current price
+        # stock id: {pos_num, price}, price is the entry (cost basis) price;
+        # pass current prices to get_total_capital() for mark-to-market value
         self.pos_dict = {}
 
         # 2. trading history log
@@ -44,12 +47,23 @@ class Account:
 
     # total capital is the sum of position current cap with account cash
     @addlog(name='get_total_capital')
-    def get_total_capital(self):
+    def get_total_capital(self, prices: Optional[Dict[str, float]] = None):
+        """
+        :param prices: optional {stock_id: current price} (e.g. the current
+            bar's close) used to mark open positions to market. Positions
+            missing from ``prices`` (or all positions, when ``prices`` is
+            None) are valued at their entry price stored in ``pos_dict``.
+            ``pos_dict`` itself is never modified.
+        :return: cash + market value of all open positions
+        """
         self.total_capital = 0
 
         # calculate pos stock market cap
-        for val in self.pos_dict.values():
-            self.total_capital += val['pos_num'] * val['price']
+        for stock_id, val in self.pos_dict.items():
+            price = val['price']
+            if prices is not None and stock_id in prices:
+                price = prices[stock_id]
+            self.total_capital += val['pos_num'] * price
 
         self.total_capital += self.cash
 
