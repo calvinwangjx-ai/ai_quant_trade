@@ -6,7 +6,7 @@ swig
 wrds
 pyportfolioopt
 tensorboard
-pyfolio
+pyfolio-reloaded  # maintained fork, same `import pyfolio`; original pyfolio fails to build on Python >= 3.12
 stable-baselines3==2.9.0
 gymnasium==1.3.0
 torch==2.14.0
