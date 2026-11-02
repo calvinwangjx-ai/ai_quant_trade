@@ -108,6 +108,11 @@ class BackTester:
 
         return df_stock_dict
 
+    def get_close_prices(self, index):
+        """Return {stock_id: close} for the bar at ``index``."""
+        return {stock_id: df['close'].iloc[index]
+                for stock_id, df in self._df_dict.items()}
+
     @addlog(name='record_log')
     def record_log(self,
                    stock_id,
@@ -206,16 +211,23 @@ class BackTester:
                                 trade_message)
 
         # 4. final trade record
-        # check total capital in account
-        total_capital = self._account.get_total_capital()
+        # check total capital in account, marking open positions to market
+        # with the current bar's close so the daily equity curve reflects
+        # unrealized P&L (pos_dict keeps the entry price as cost basis)
+        total_capital = self._account.get_total_capital(self.get_close_prices(index))
         self._account.funds_chg_lst.append(total_capital)
 
         if trade_sign:
             # add trading record
-            for stock_id in self._account.trade_dict.keys():
-                # -1: change last data line due to above assigned value is incorrect
-                #   we reassign value here
-                self._account.trade_dict[stock_id].iloc[-1]['capital'] = total_capital
+            for df_trade in self._account.trade_dict.values():
+                # record_log() stored the pre-trade capital on the rows it
+                # added for this bar; overwrite them with the post-trade
+                # value. Only touch stocks that actually traded this bar.
+                # (single-step .loc so the write is not lost under pandas
+                # Copy-on-Write, unlike chained ``.iloc[-1]['capital']``)
+                last = df_trade.index[-1]
+                if df_trade.at[last, 'time_index'] == index:
+                    df_trade.loc[last, 'capital'] = total_capital
 
             message = 'Account Total Capital: %.2f' % total_capital
             self._account.daily_trading_lst.append(message + '\n')
@@ -243,16 +255,23 @@ class BackTester:
 
         log.info('*** Total Trading Times: %d' % self._trade_cnt)
 
+        # trade date of each funds_chg_lst entry (one per bar from index 1,
+        # after MA warm-up rows were dropped), to align with the benchmark
+        first_df = next(iter(self._df_dict.values()))
+        trade_dates = first_df['trade_date'].iloc[1:self._data_len].tolist()
+
         # calculate risk indicator
         df_result = cal_risk_indicator(self.test_conditions['capital'],
                                        self.test_conditions['base_rate'],
                                        self._account.funds_chg_lst,
                                        self._account.pd_gather_trades,
                                        self._df_benchmark,
-                                       self._args.exp_dir)
+                                       self._args.exp_dir,
+                                       trade_dates=trade_dates)
         print(df_result)
 
-        total_capital = self._account.get_total_capital()
+        total_capital = self._account.get_total_capital(
+            self.get_close_prices(self._data_len - 1))
         print('Account Capital: ', total_capital)
         print('Account Net Profit: ',
               total_capital - self.test_conditions['capital'])

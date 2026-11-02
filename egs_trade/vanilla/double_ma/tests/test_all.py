@@ -46,6 +46,76 @@ class TestAccount:
         # cash 50_000 + position 100 * 11 = 1_100 = 51_100
         assert a.get_total_capital() == 51_100
 
+    def test_open_position_marked_to_market(self):
+        a = Account(50_000)
+        a.pos_dict['600000.SH'] = {'pos_num': 100, 'price': 11.0}
+        # value moves with the current price
+        assert a.get_total_capital({'600000.SH': 12.5}) == 50_000 + 100 * 12.5
+        assert a.total_capital == 51_250
+        assert a.get_total_capital({'600000.SH': 9.0}) == 50_000 + 100 * 9.0
+        # cost basis is left untouched
+        assert a.pos_dict['600000.SH']['price'] == 11.0
+        # no prices -> entry-price valuation (existing behaviour)
+        assert a.get_total_capital() == 51_100
+
+    def test_mark_to_market_falls_back_to_entry_price(self):
+        a = Account(0)
+        a.pos_dict['A'] = {'pos_num': 10, 'price': 5.0}
+        a.pos_dict['B'] = {'pos_num': 20, 'price': 2.0}
+        # only A has a quote; B keeps its entry price; unheld C is ignored
+        assert a.get_total_capital({'A': 6.0, 'C': 100.0}) == 10 * 6.0 + 20 * 2.0
+
+
+class TestAddLog:
+    """Failures must not be reported as success: @addlog logs, then
+    re-raises (an uncaught exception exits the process non-zero)."""
+
+    def test_exception_propagates_instead_of_exit(self):
+        import pytest
+        from src.tools.log.log_util import addlog
+
+        @addlog(name='inner')
+        def inner():
+            raise ValueError('boom')
+
+        @addlog(name='outer')
+        def outer():
+            return inner()
+
+        with pytest.raises(ValueError, match='boom'):
+            outer()
+
+    def test_return_value_passes_through(self):
+        from src.tools.log.log_util import addlog
+
+        @addlog(name='ok')
+        def ok(x):
+            return x * 2
+
+        assert ok(21) == 42
+
+
+class TestRiskIndicatorRealFfn:
+    def test_ratios_with_integer_indexed_equity(self, tmp_path):
+        """Real ffn cannot infer frequency from a plain list; must not crash."""
+        import pytest
+        ffn = pytest.importorskip('ffn')
+        if isinstance(ffn, mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+
+        rng = np.random.default_rng(0)
+        equity = list(100_000 * np.cumprod(1 + rng.normal(0.001, 0.01, 60)))
+        df_trade = pd.DataFrame({'time_index': [5, 20, 40],
+                                 'capital': [99_000.0, 101_000.0, 103_000.0],
+                                 'trade_detail': ['b', 's', 'b']})
+        df_res = cal_risk_indicator(100_000, 0.04, equity, df_trade,
+                                    pd.DataFrame(), str(tmp_path))
+
+        for key in ('sharp_ratio', 'sortino_ratio', 'max_withdraw'):
+            assert np.isfinite(float(df_res.loc[key, 'value'])), key
+        assert (tmp_path / 'risk_indicator.csv').exists()
+
 
 class TestCalculateFee:
     def test_buy_commission_only(self):
@@ -132,6 +202,96 @@ class TestEqualAllocation:
         assert equal_allocation(a, select_num=3) == 0
 
 
+# ---------------- risk indicator: beta / alpha (real ffn) ----------------
+class TestRiskIndicatorBeta:
+    """Needs the real ``ffn``; runs before the mocked e2e test, which
+    injects a fake ``ffn`` into ``sys.modules``."""
+
+    @staticmethod
+    def _cal_risk_indicator():
+        import pytest
+        pytest.importorskip('ffn')
+        if isinstance(sys.modules.get('ffn'), mock.MagicMock):
+            pytest.skip('ffn is mocked in this session')
+        from src.back_test.risk_indicator import cal_risk_indicator
+        return cal_risk_indicator
+
+    @staticmethod
+    def _benchmark(n=100, seed=0):
+        rng = np.random.default_rng(seed)
+        dates = pd.bdate_range('2022-01-03', periods=n).strftime('%Y%m%d')
+        return pd.DataFrame({
+            'trade_date': dates,
+            'close': 3000 * np.cumprod(1 + rng.normal(0, 0.01, n)),
+            'pct_chg': rng.normal(0.05, 1.0, n),  # percent, like tushare
+        })
+
+    @staticmethod
+    def _trades(capital_list):
+        return pd.DataFrame({'time_index': [0, 1],
+                             'capital': capital_list[:2],
+                             'trade_detail': ['buy', 'sell']})
+
+    def test_double_benchmark_returns_gives_beta_two(self, tmp_path):
+        cal_risk_indicator = self._cal_risk_indicator()
+        df_index = self._benchmark()
+        df_index_before = df_index.copy(deep=True)
+
+        # strategy only covers bars after a 20-bar warm-up (like the MA
+        # drop + skipped bar 0), so alignment must be by trade date
+        start = 20
+        bench_ret = df_index['pct_chg'].to_numpy()[start:] / 100
+        strat_ret = 2 * bench_ret
+        strat_ret[0] = 0.0  # first bar has no previous capital
+        capital_list = list(100_000 * np.cumprod(1 + strat_ret))
+        trade_dates = df_index['trade_date'].iloc[start:].tolist()
+
+        base_rise = 0.04
+        df = cal_risk_indicator(100_000, base_rise, capital_list,
+                                self._trades(capital_list), df_index,
+                                str(tmp_path), trade_dates=trade_dates)
+
+        beta = float(df.loc['beta', 'value'])
+        assert abs(beta - 2.0) < 1e-9
+
+        # alpha uses compounded fractional returns over the aligned bars
+        rise = np.prod(1 + strat_ret[1:]) - 1
+        sign_rise = np.prod(1 + bench_ret[1:]) - 1
+        # annual risk-free rate compounded over the aligned bars (250/yr)
+        rf = (1 + base_rise) ** ((len(strat_ret) - 1) / 250) - 1
+        expected_alpha = rise - (rf + 2.0 * (sign_rise - rf))
+        assert abs(float(df.loc['alpha', 'value']) - expected_alpha) < 1e-9
+
+        # caller's benchmark must not be modified
+        pd.testing.assert_frame_equal(df_index, df_index_before)
+
+    def test_zero_variance_benchmark_gives_nan_beta(self, tmp_path):
+        cal_risk_indicator = self._cal_risk_indicator()
+        df_index = self._benchmark()
+        df_index['pct_chg'] = 0.0
+        capital_list = list(np.linspace(100_000, 110_000, len(df_index)))
+        df = cal_risk_indicator(100_000, 0.04, capital_list,
+                                self._trades(capital_list), df_index,
+                                str(tmp_path),
+                                trade_dates=df_index['trade_date'].tolist())
+        assert np.isnan(float(df.loc['beta', 'value']))
+
+    def test_benchmark_without_trade_dates_raises(self, tmp_path):
+        # @addlog re-raises, so the error reaches the caller
+        import pytest
+        cal_risk_indicator = self._cal_risk_indicator()
+        df_index = self._benchmark()
+        capital_list = list(np.linspace(100_000, 110_000, len(df_index)))
+        trades = self._trades(capital_list)
+        with pytest.raises(ValueError, match='trade_dates'):
+            cal_risk_indicator(100_000, 0.04, capital_list, trades,
+                               df_index, str(tmp_path))
+        with pytest.raises(ValueError, match='same length'):
+            cal_risk_indicator(100_000, 0.04, capital_list, trades,
+                               df_index, str(tmp_path),
+                               trade_dates=df_index['trade_date'].tolist()[1:])
+
+
 # ---------------- end-to-end back tester (mocked TuShare) ----------------
 class TestBackTesterE2E:
     def _build_args(self, exp_dir):
@@ -208,6 +368,18 @@ class TestBackTesterE2E:
             'No trades happened in e2e simulation; trade_dict=%r' %
             {k: len(v) for k, v in bt._account.trade_dict.items()}
         )
+        # daily equity is marked to market: it must change on bars without
+        # trades while a position is held. With realized-only valuation the
+        # number of distinct equity values is bounded by (trade days + 1).
+        funds = bt._account.funds_chg_lst
+        assert len(funds) == bt._data_len - 1
+        n_trade_days = len(bt._account.pd_gather_trades)
+        assert len(set(np.round(funds, 6))) > n_trade_days + 1, funds
+        # each trade row carries the post-trade equity of the bar it traded
+        # on (bars start at index 1, funds_chg_lst at 0)
+        for stock_id, df_trade in bt._account.trade_dict.items():
+            for t_idx, cap in zip(df_trade['time_index'], df_trade['capital']):
+                assert np.isclose(cap, funds[int(t_idx) - 1]), (stock_id, t_idx)
         # risk indicator csv should be saved
         assert (tmp_path / 'risk_indicator.csv').exists()
         assert (tmp_path / 'trading_info.csv').exists()
