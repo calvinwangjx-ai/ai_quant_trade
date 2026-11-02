@@ -143,6 +143,7 @@ class BackTester:
     def trading_ctrl(self, index):
         trade_sign = False
         trade_message = ''
+        traded_lst = []  # stocks that actually traded on this bar
 
         # todo: potential bug for multiple stock trading
         #  different order of buy and sell, may raise issue of no cash
@@ -176,6 +177,7 @@ class BackTester:
             # log trading info into account for historical check
             if len(order_type):
                 trade_sign = True
+                traded_lst.append(stock_id)
                 self.record_log(stock_id,
                                 index,
                                 order_type,
@@ -199,23 +201,34 @@ class BackTester:
             # log trading info into account for historical check
             if len(order_type):
                 trade_sign = True
+                traded_lst.append(stock_id)
                 self.record_log(stock_id,
                                 index,
                                 order_type,
                                 pos,
                                 trade_message)
 
-        # 4. final trade record
+        # 4. mark open positions to market at this bar's close, so equity
+        # moves on bars without trades (order_value only prices a position
+        # when it is bought).
+        for stock_id, pos_info in self._account.pos_dict.items():
+            pos_info['price'] = self._df_dict[stock_id]['close'].iloc[index]
+
+        # 5. final trade record
         # check total capital in account
         total_capital = self._account.get_total_capital()
         self._account.funds_chg_lst.append(total_capital)
 
         if trade_sign:
-            # add trading record
-            for stock_id in self._account.trade_dict.keys():
-                # -1: change last data line due to above assigned value is incorrect
-                #   we reassign value here
-                self._account.trade_dict[stock_id].iloc[-1]['capital'] = total_capital
+            # record_log() stored the capital as of each individual order;
+            # overwrite it with the post-trade equity for this bar. Only touch
+            # stocks that traded on this bar: other stocks' last rows belong to
+            # earlier bars and already hold their own bar's equity.
+            # Single-step .iloc assignment so it takes effect under pandas
+            # Copy-on-Write (chained ``.iloc[-1]['capital'] = ...`` is a no-op).
+            for stock_id in traded_lst:
+                df_trade = self._account.trade_dict[stock_id]
+                df_trade.iloc[-1, df_trade.columns.get_loc('capital')] = total_capital
 
             message = 'Account Total Capital: %.2f' % total_capital
             self._account.daily_trading_lst.append(message + '\n')
